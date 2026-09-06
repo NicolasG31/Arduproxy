@@ -14,6 +14,8 @@ A small Tkinter + pymavlink GUI app for testing a Ground Control Station (GCS). 
   - **Message** — pick any regular MAVLink message from a dropdown, shown as `ID - NAME` (e.g. `0 - HEARTBEAT`), fill in its fields in a form generated on the fly from `pymavlink`'s message definitions (so field names, types, and valid enum values always match what `pymavlink` actually supports), and click **Send** to fire it once.
   - **Command (MAV_CMD)** — pick any MAV_CMD command (e.g. `400 - MAV_CMD_COMPONENT_ARM_DISARM`), shown with its real description and per-parameter help text pulled straight from the MAVLink XML (so you know what `param1`..`param7` actually mean for that specific command), set the target system/component and confirmation, and click **Send Command** to fire it as a `COMMAND_LONG`.
   - Both pickers have a **Search** box that filters the dropdown live as you type, matching either a substring of the name or its numeric ID (e.g. typing `24` narrows the message picker to `GPS_RAW_INT`, whose ID is 24; typing `arm` narrows the command picker to `MAV_CMD_COMPONENT_ARM_DISARM`). If the current selection falls out of the filtered results, the picker jumps to the first match automatically; clearing the search restores the full list; if nothing matches, the dropdown empties but the current selection and form are left alone.
+  - Next to **Send** / **Send Command** is a **"Repeat every: [rate] [s/Hz] [Start Repeating]"** control — fill in a message/command's fields as usual, pick a rate (either an interval in seconds like `0.5`, or a frequency in Hz like `2`), and click it to have that exact message/command resent on a background timer instead of just once.
+- Every active repeat shows up in the **Repeating** panel below the tabs (visible regardless of which tab is active), with its rate editable in place, a **Pause**/**Resume** toggle, a **Remove** button, and a live status line (send count and time since last send, or the last error if sends started failing).
 - MAVProxy receives these packets on its input link and forwards them to every output it's configured with — including your real GCS connection — exactly as if they'd come from the vehicle.
 
 ### Connecting to MAVProxy
@@ -63,6 +65,20 @@ Other supported forms:
 
 6. **Send a command:** on the **Command (MAV_CMD)** tab, search `arm` to find `400 - MAV_CMD_COMPONENT_ARM_DISARM`, read the per-parameter help text (`param1` explains 1=arm/0=disarm), set `param1` to `1`, and click **Send Command**.
 
+7. **Repeat a message:** on the **Message** tab, pick e.g. `ATTITUDE`, set "Repeat every" to `10` with unit `Hz`, and click **Start Repeating**. It appears in the **Repeating** panel below, sending continuously; watch the send count tick up, then try **Pause**, **Resume**, changing the rate and clicking **Apply**, and finally **Remove**.
+
+## Repeating sends
+
+Any message or command can be sent on a repeating timer instead of once:
+
+- **Rate:** enter a number and choose the unit — **s** (interval in seconds, e.g. `0.5` = twice a second) or **Hz** (times per second, e.g. `2`). Both are accepted everywhere a rate is entered, including when editing an existing repeat's rate in the panel.
+- **Field values are snapshotted** at the moment you click **Start Repeating** — editing the form afterward does not affect an already-running repeat; start a new one (or remove and re-add) to change what's being sent.
+- **Commands auto-increment `confirmation`** on every repeat (starting from whatever value was in the Confirmation field when you clicked Start Repeating, wrapping at 256), mirroring how a real GCS marks retries of the same command rather than resending byte-identical packets forever.
+- **Pause** stops sending without losing the entry or its send count; **Resume** continues from where it left off. **Remove** stops and deletes it.
+- Rate changes made via the panel's **Apply** button take effect from the entry's *next* send cycle onward (a change mid-wait doesn't cut the current wait short).
+- **Disconnecting stops and clears every active repeat** (both the explicit Disconnect button and an automatic disconnect from a failed heartbeat) — repeats aren't paused-and-resumable across a reconnect, they're gone; start them again after reconnecting. This is a deliberate simplification, not a limitation we plan to lift automatically, since silently resuming background sends on reconnect seemed more surprising than convenient.
+- The `HEARTBEAT` auto-sent every 1s by the connection itself (see above) is independent of this feature — you *can* also add a repeating `HEARTBEAT` from the Message tab (e.g. at a different rate), but note that would mean two separate heartbeat streams running at once.
+
 ## Supported messages and commands
 
 - **Messages:** every message in `pymavlink`'s ArduPilot (v2.0) dialect (~295 messages) is available on the **Message** tab — search by name or numeric ID to find the one you need. Form fields are generated automatically per message:
@@ -80,16 +96,17 @@ Other supported forms:
 | File | Purpose |
 |---|---|
 | `main.py` | Entry point — creates the Tk root window and starts the app |
-| `gui.py` | Connect dialog, main window (Message tab + Command tab), the shared `SearchablePicker` search/dropdown widget, dynamic parameter forms, send/log logic |
+| `gui.py` | Connect dialog, main window (Message tab + Command tab + Repeating panel), the shared `SearchablePicker` search/dropdown widget, dynamic parameter forms, send/log logic |
 | `mav_connection.py` | Wraps a `pymavlink` connection; runs the background heartbeat thread; thread-safe `send()` |
 | `mav_messages.py` | Reads message/field/command metadata off `pymavlink`'s ArduPilot dialect and builds/parses messages and commands from form input |
+| `repeat_manager.py` | One background thread per active repeat (rate, pause, send count, last error); independent of the connection's own heartbeat loop |
 
 ## Known limitations / ideas for v2
 
-- No repeat/streaming send — every click (besides the automatic heartbeat) sends exactly one message.
-- Commands only support `COMMAND_LONG`, not `COMMAND_INT` (which uses `x`/`y`/`z` + a coordinate frame instead of `param5`-`param7`, and is mainly used for guided-mode position commands).
+- Commands only support `COMMAND_LONG`, not `COMMAND_INT` (which uses `x`/`y`/`z` + a coordinate frame instead of `param5`-`param7`, and is mainly used for guided-mode position commands). Repeating inherits this limitation too.
 - Bitmask fields are raw integer entry rather than a checkbox-per-flag UI.
 - No display of `COMMAND_ACK` or any other reply the GCS/MAVProxy might send back — this app only sends, it doesn't listen.
+- Repeats don't survive a disconnect/reconnect (see "Repeating sends" above) — this was a deliberate v1 choice, not an oversight.
 
 ## A note on `pymavlink` field metadata
 

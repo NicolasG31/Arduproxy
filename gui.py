@@ -1,14 +1,20 @@
 """Tkinter GUI: connect dialog + main window with two tabs -
 "Message" (regular MAVLink telemetry/status messages) and
 "Command (MAV_CMD)" (COMMAND_LONG) - each with a searchable picker,
-a dynamically generated parameter form, and a shared send log.
+a dynamically generated parameter form, and a repeat-send control; plus a
+shared "Repeating" panel and send log.
 """
+import itertools
+import time
 import tkinter as tk
 from datetime import datetime
 from tkinter import messagebox, ttk
 
 import mav_messages as mm
 from mav_connection import ConnectionManager
+from repeat_manager import RepeatManager
+
+REPEAT_STATUS_REFRESH_MS = 500
 
 DEFAULT_CONN_STRING = "udpout:127.0.0.1:14550"
 
@@ -104,11 +110,18 @@ def show_connect_dialog(parent, conn_mgr: ConnectionManager) -> bool:
 
 
 class ScrollableFrame(ttk.Frame):
-    """A vertically scrollable container for a parameter form."""
+    """A vertically scrollable container for a parameter form or list.
 
-    def __init__(self, parent, **kwargs):
+    canvas_height fixes the visible height (e.g. for the Repeating panel, so
+    it doesn't grow unbounded with entries); omit it to size to the parent.
+    """
+
+    def __init__(self, parent, canvas_height=None, **kwargs):
         super().__init__(parent, **kwargs)
-        canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
+        canvas_kwargs = {"borderwidth": 0, "highlightthickness": 0}
+        if canvas_height is not None:
+            canvas_kwargs["height"] = canvas_height
+        canvas = tk.Canvas(self, **canvas_kwargs)
         scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
         self.inner = ttk.Frame(canvas)
 
@@ -186,11 +199,14 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("MAVProxy Vehicle Spoofer")
-        self.root.geometry("700x600")
+        self.root.geometry("760x780")
+        self.root.minsize(640, 560)
 
         self.conn_mgr = ConnectionManager()
         self.conn_mgr.on_status = self._threadsafe_log
         self.conn_mgr.on_disconnect = self._threadsafe_on_disconnect
+        self.repeat_mgr = RepeatManager(self.conn_mgr)
+        self.repeat_status_vars = {}  # entry id -> StringVar, refreshed periodically
 
         self.field_getters = {}  # field name -> callable returning raw string
         self.current_msg_name = None
@@ -201,6 +217,8 @@ class App:
         self._update_connection_ui()
         self._on_message_selected()
         self._on_command_selected()
+        self._rebuild_repeat_rows()
+        self._refresh_repeat_status()
 
     # ---- layout -----------------------------------------------------
     def _build_layout(self):
@@ -226,6 +244,11 @@ class App:
         notebook.add(cmd_tab, text="Command (MAV_CMD)")
         self._build_command_tab(cmd_tab)
 
+        repeat_frame = ttk.LabelFrame(self.root, text="Repeating", padding=(8, 4))
+        repeat_frame.pack(fill="x", padx=8, pady=(0, 4))
+        self.repeat_list = ScrollableFrame(repeat_frame, canvas_height=130)
+        self.repeat_list.pack(fill="both", expand=True)
+
         log_frame = ttk.Frame(self.root, padding=(8, 0, 8, 8))
         log_frame.pack(fill="both", expand=False)
         ttk.Label(log_frame, text="Log:").pack(anchor="w")
@@ -246,6 +269,10 @@ class App:
         bottom.pack(fill="x")
         self.send_btn = ttk.Button(bottom, text="Send", command=self._on_send_clicked)
         self.send_btn.pack(side="left")
+
+        self.msg_repeat_rate_var, self.msg_repeat_unit_var, self.msg_repeat_btn = self._build_repeat_controls(
+            bottom, self._on_start_message_repeat
+        )
 
     def _build_command_tab(self, parent):
         self.cmd_picker = SearchablePicker(
@@ -278,6 +305,33 @@ class App:
         self.cmd_send_btn = ttk.Button(bottom, text="Send Command", command=self._on_send_command_clicked)
         self.cmd_send_btn.pack(side="left")
 
+        self.cmd_repeat_rate_var, self.cmd_repeat_unit_var, self.cmd_repeat_btn = self._build_repeat_controls(
+            bottom, self._on_start_command_repeat
+        )
+
+    @staticmethod
+    def _build_repeat_controls(parent, start_command):
+        ttk.Label(parent, text="Repeat every:").pack(side="left", padx=(16, 4))
+        rate_var = tk.StringVar(value="1.0")
+        ttk.Entry(parent, textvariable=rate_var, width=8).pack(side="left")
+        unit_var = tk.StringVar(value="s")
+        ttk.Combobox(parent, textvariable=unit_var, values=["s", "Hz"], width=4, state="readonly").pack(
+            side="left", padx=(2, 8)
+        )
+        btn = ttk.Button(parent, text="Start Repeating", command=start_command)
+        btn.pack(side="left")
+        return rate_var, unit_var, btn
+
+    @staticmethod
+    def _parse_rate(rate_text, unit):
+        try:
+            value = float(rate_text)
+        except ValueError:
+            raise ValueError("Rate must be a number.")
+        if value <= 0:
+            raise ValueError("Rate must be greater than zero.")
+        return (1.0 / value) if unit == "Hz" else value
+
     # ---- connection ---------------------------------------------------
     def _on_connect_clicked(self):
         if show_connect_dialog(self.root, self.conn_mgr):
@@ -286,11 +340,20 @@ class App:
 
     def _on_disconnect_clicked(self):
         self.conn_mgr.disconnect()
-        self.log("Disconnected.")
+        self._stop_all_repeats("Disconnected.")
         self._update_connection_ui()
 
     def _threadsafe_on_disconnect(self):
-        self.root.after(0, self._update_connection_ui)
+        def handle():
+            self._stop_all_repeats("Link dropped; all repeating sends stopped.")
+            self._update_connection_ui()
+        self.root.after(0, handle)
+
+    def _stop_all_repeats(self, log_message):
+        had_entries = bool(self.repeat_mgr.entries)
+        self.repeat_mgr.stop_all()
+        self._rebuild_repeat_rows()
+        self.log(log_message if not had_entries else f"{log_message} (repeats cleared)")
 
     def _update_connection_ui(self):
         connected = self.conn_mgr.connected
@@ -299,6 +362,8 @@ class App:
         self.disconnect_btn.configure(state="normal" if connected else "disabled")
         self.send_btn.configure(state="normal" if connected else "disabled")
         self.cmd_send_btn.configure(state="normal" if connected else "disabled")
+        self.msg_repeat_btn.configure(state="normal" if connected else "disabled")
+        self.cmd_repeat_btn.configure(state="normal" if connected else "disabled")
 
     # ---- message form ---------------------------------------------------
     def _on_message_selected(self):
@@ -418,6 +483,140 @@ class App:
         self.log(
             f"Sent COMMAND_LONG {cmd_name} ({cmd_value}) to {target_system}.{target_component}: params={params}"
         )
+
+    # ---- repeat: starting a new one ---------------------------------
+    def _on_start_message_repeat(self):
+        try:
+            interval = self._parse_rate(self.msg_repeat_rate_var.get(), self.msg_repeat_unit_var.get())
+        except ValueError as exc:
+            messagebox.showerror("Invalid rate", str(exc))
+            return
+
+        msg_name = self.current_msg_name
+        msg_cls = mm.get_message_class(msg_name)
+        specs = mm.get_field_specs(msg_cls)
+        raw_values = {name: getter() for name, getter in self.field_getters.items()}
+
+        try:
+            mm.build_message(msg_cls, specs, raw_values)  # validate now, fail fast
+        except Exception as exc:
+            messagebox.showerror("Invalid parameters", str(exc))
+            return
+
+        def builder(cls=msg_cls, sp=specs, rv=dict(raw_values)):
+            return mm.build_message(cls, sp, rv)
+
+        label = f"{msg_name} ({msg_cls.id})"
+        self.repeat_mgr.add(label, "message", builder, interval)
+        self._rebuild_repeat_rows()
+        self.log(f"Started repeating {label} every {interval:g}s")
+
+    def _on_start_command_repeat(self):
+        try:
+            interval = self._parse_rate(self.cmd_repeat_rate_var.get(), self.cmd_repeat_unit_var.get())
+        except ValueError as exc:
+            messagebox.showerror("Invalid rate", str(exc))
+            return
+
+        cmd_value = self.current_cmd_value
+        cmd_name = self.cmd_picker.current_name()
+        try:
+            target_system = int(self.cmd_target_system_var.get())
+            target_component = int(self.cmd_target_component_var.get())
+            confirmation_start = int(self.cmd_confirmation_var.get())
+            params = [mm.parse_scalar("float", self.cmd_field_getters[f"param{i}"]()) for i in range(1, 8)]
+        except ValueError as exc:
+            messagebox.showerror("Invalid parameters", str(exc))
+            return
+
+        # Auto-increment confirmation on each repeat, like a real GCS retrying
+        # a command, instead of resending byte-identical packets forever.
+        confirmation_counter = itertools.count(confirmation_start)
+
+        def builder(cv=cmd_value, ts=target_system, tc=target_component, p=params, counter=confirmation_counter):
+            return mm.build_command_long(cv, ts, tc, next(counter) % 256, p)
+
+        label = f"{cmd_name} ({cmd_value})"
+        self.repeat_mgr.add(label, "command", builder, interval)
+        self._rebuild_repeat_rows()
+        self.log(
+            f"Started repeating COMMAND_LONG {label} every {interval:g}s "
+            f"(confirmation auto-incrementing from {confirmation_start})"
+        )
+
+    # ---- repeat: the shared "Repeating" panel ------------------------
+    def _rebuild_repeat_rows(self):
+        for child in self.repeat_list.inner.winfo_children():
+            child.destroy()
+        self.repeat_status_vars = {}
+
+        entries = sorted(self.repeat_mgr.entries.values(), key=lambda e: e.id)
+        if not entries:
+            ttk.Label(self.repeat_list.inner, text="(none - use \"Start Repeating\" on a tab above)", foreground="#888").grid(
+                row=0, column=0, sticky="w"
+            )
+            return
+
+        for row, entry in enumerate(entries):
+            kind_tag = "MSG" if entry.kind == "message" else "CMD"
+            ttk.Label(self.repeat_list.inner, text=f"[{kind_tag}] {entry.label}").grid(
+                row=row, column=0, sticky="w", padx=(0, 8), pady=2
+            )
+
+            rate_var = tk.StringVar(value=f"{entry.interval_seconds:g}")
+            unit_var = tk.StringVar(value="s")
+            ttk.Entry(self.repeat_list.inner, textvariable=rate_var, width=7).grid(row=row, column=1, sticky="w")
+            ttk.Combobox(
+                self.repeat_list.inner, textvariable=unit_var, values=["s", "Hz"], width=4, state="readonly"
+            ).grid(row=row, column=2, sticky="w", padx=(2, 4))
+
+            def apply_rate(entry_id=entry.id, rate_var=rate_var, unit_var=unit_var):
+                try:
+                    new_interval = self._parse_rate(rate_var.get(), unit_var.get())
+                except ValueError as exc:
+                    messagebox.showerror("Invalid rate", str(exc))
+                    return
+                self.repeat_mgr.set_interval(entry_id, new_interval)
+
+            ttk.Button(self.repeat_list.inner, text="Apply", command=apply_rate).grid(row=row, column=3, padx=4)
+
+            status_var = tk.StringVar(value="")
+            ttk.Label(self.repeat_list.inner, textvariable=status_var, foreground="#555").grid(
+                row=row, column=4, sticky="w", padx=8
+            )
+            self.repeat_status_vars[entry.id] = status_var
+
+            def toggle_pause(entry_id=entry.id):
+                current = self.repeat_mgr.entries.get(entry_id)
+                if current is not None:
+                    self.repeat_mgr.set_paused(entry_id, not current.paused)
+                    self._rebuild_repeat_rows()
+
+            ttk.Button(
+                self.repeat_list.inner, text="Resume" if entry.paused else "Pause", command=toggle_pause
+            ).grid(row=row, column=5, padx=4)
+
+            def remove_entry(entry_id=entry.id):
+                self.repeat_mgr.remove(entry_id)
+                self._rebuild_repeat_rows()
+
+            ttk.Button(self.repeat_list.inner, text="Remove", command=remove_entry).grid(row=row, column=6, padx=4)
+
+    def _refresh_repeat_status(self):
+        for entry_id, status_var in self.repeat_status_vars.items():
+            entry = self.repeat_mgr.entries.get(entry_id)
+            if entry is None:
+                continue
+            if entry.paused:
+                status_var.set(f"paused (sent {entry.send_count}x)")
+            elif entry.last_error:
+                status_var.set(f"ERROR: {entry.last_error}")
+            elif entry.last_sent is not None:
+                age = time.time() - entry.last_sent
+                status_var.set(f"sent {entry.send_count}x, last {age:.1f}s ago")
+            else:
+                status_var.set("not sent yet")
+        self.root.after(REPEAT_STATUS_REFRESH_MS, self._refresh_repeat_status)
 
     # ---- logging ---------------------------------------------------
     def log(self, text):
