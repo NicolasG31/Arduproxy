@@ -15,8 +15,9 @@ A small Tkinter + pymavlink GUI app for testing a Ground Control Station (GCS). 
   - **Command (MAV_CMD)** — pick any MAV_CMD command (e.g. `400 - MAV_CMD_COMPONENT_ARM_DISARM`), shown with its real description and per-parameter help text pulled straight from the MAVLink XML (so you know what `param1`..`param7` actually mean for that specific command), set the target system/component and confirmation, and click **Send Command** to fire it as a `COMMAND_LONG`.
   - Both pickers have a **Search** box that filters the dropdown live as you type, matching either a substring of the name or its numeric ID (e.g. typing `24` narrows the message picker to `GPS_RAW_INT`, whose ID is 24; typing `arm` narrows the command picker to `MAV_CMD_COMPONENT_ARM_DISARM`). If the current selection falls out of the filtered results, the picker jumps to the first match automatically; clearing the search restores the full list; if nothing matches, the dropdown empties but the current selection and form are left alone.
   - Next to **Send** / **Send Command** is a **"Repeat every: [rate] [s/Hz] [Start Repeating]"** control — fill in a message/command's fields as usual, pick a rate (either an interval in seconds like `0.5`, or a frequency in Hz like `2`), and click it to have that exact message/command resent on a background timer instead of just once.
-- Every active repeat shows up in the **Repeating** panel below the tabs (visible regardless of which tab is active), with its rate editable in place, a **Pause**/**Resume** toggle, a **Remove** button, and a live status line (send count and time since last send, or the last error if sends started failing).
+- Every active repeat shows up in the **▶ Repeating** panel below the tabs (visible regardless of which tab is active) — collapsed by default, showing just a count (e.g. `▶ Repeating (2 active)`); click it to expand and see each entry, with its rate editable in place, a **Pause**/**Resume** toggle, a **Remove** button, and a live status line (send count and time since last send, or the last error if sends started failing).
 - MAVProxy receives these packets on its input link and forwards them to every output it's configured with — including your real GCS connection — exactly as if they'd come from the vehicle.
+- The app also **listens**: anything MAVProxy forwards back down that same link (e.g. a `COMMAND_LONG` your GCS issues — arm, mode change, takeoff, ...) is logged as a `RECV` line. By default it also **auto-replies with `COMMAND_ACK`** to any incoming `COMMAND_LONG`, via the **"Incoming commands"** controls at the bottom of the **Command (MAV_CMD)** tab (checkbox + result dropdown) — without this, GCS actions that wait for an acknowledgement would just hang against this app instead of showing you a reaction.
 
 ### Connecting to MAVProxy
 
@@ -65,12 +66,28 @@ Other supported forms:
 
 6. **Send a command:** on the **Command (MAV_CMD)** tab, search `arm` to find `400 - MAV_CMD_COMPONENT_ARM_DISARM`, read the per-parameter help text (`param1` explains 1=arm/0=disarm), set `param1` to `1`, and click **Send Command**.
 
-7. **Repeat a message:** on the **Message** tab, pick e.g. `ATTITUDE`, set "Repeat every" to `10` with unit `Hz`, and click **Start Repeating**. It appears in the **Repeating** panel below, sending continuously; watch the send count tick up, then try **Pause**, **Resume**, changing the rate and clicking **Apply**, and finally **Remove**.
+7. **Repeat a message:** on the **Message** tab, pick e.g. `ATTITUDE`, set "Repeat every" to `10` with unit `Hz`, and click **Start Repeating**. The **▶ Repeating** bar below now reads `▶ Repeating (1 active)`; click it to expand and watch the send count tick up, then try **Pause**, **Resume**, changing the rate and clicking **Apply**, and finally **Remove**.
+
+8. **See it listen:** trigger anything in your real GCS that sends a command to the vehicle (e.g. its arm button). You should see a `RECV COMMAND_LONG ...` line in the log almost immediately followed by `Auto-ACK sent for ...`, and your GCS should show the command as accepted instead of timing out.
+
+## Listening and auto-ACK
+
+The app doesn't just send — the same link is read continuously in the background:
+
+- Every message received is logged as `RECV <TYPE> from sys<X>.comp<Y>: <fields>`.
+- Any incoming `COMMAND_LONG` gets an automatic `COMMAND_ACK` reply when the **"Auto-ACK incoming COMMAND_LONG with result:"** checkbox, in the **Incoming commands** box at the bottom of the **Command (MAV_CMD)** tab, is ticked — **on by default**. The ack is addressed back to whoever sent the command (its `target_system`/`target_component` are set from the incoming message's source, not the app's own identity), with `command` matching what was requested and `result` taken from the dropdown next to the checkbox (any `MAV_RESULT` value — `ACCEPTED`, `DENIED`, `TEMPORARILY_REJECTED`, etc. — so you can test how your GCS handles a rejected command, not just the happy path).
+- Turn the checkbox off to test what your GCS does when a command is never acknowledged (e.g. a timeout/retry path), since that's now a deliberate choice rather than this app's only mode.
+- A **Clear Log** button (top-right of the log panel) is provided since RECV lines can add up quickly if your GCS polls frequently.
+
+### A Windows-specific gotcha we hit building this
+
+pymavlink's UDP *client* sockets (`udpout:`, or `udp:` without `input=True`) are only bound to a local port implicitly, by the OS, on their first outgoing `sendto()`. On Windows, calling `recvfrom()` on the socket before that first send has happened raises `WSAEINVAL` ("An invalid argument was supplied") — and since the receive thread and the heartbeat thread both start immediately on connect, the receive thread could win that race. `mav_connection._bind_udp_client_socket()` binds the socket explicitly and synchronously right after connecting, before either thread touches it, closing the race. This only matters for UDP client mode; UDP server (`udpin:`) and other connection types were never affected.
 
 ## Repeating sends
 
 Any message or command can be sent on a repeating timer instead of once:
 
+- The **Repeating** panel starts **collapsed** (just a `▶ Repeating` bar, or `▶ Repeating (N active)` once something is running) so it stays out of the way when you're not using it; click the bar to expand/collapse. Starting or stopping a repeat updates the count immediately whether or not the panel is expanded.
 - **Rate:** enter a number and choose the unit — **s** (interval in seconds, e.g. `0.5` = twice a second) or **Hz** (times per second, e.g. `2`). Both are accepted everywhere a rate is entered, including when editing an existing repeat's rate in the panel.
 - **Field values are snapshotted** at the moment you click **Start Repeating** — editing the form afterward does not affect an already-running repeat; start a new one (or remove and re-add) to change what's being sent.
 - **Commands auto-increment `confirmation`** on every repeat (starting from whatever value was in the Confirmation field when you clicked Start Repeating, wrapping at 256), mirroring how a real GCS marks retries of the same command rather than resending byte-identical packets forever.
@@ -96,17 +113,18 @@ Any message or command can be sent on a repeating timer instead of once:
 | File | Purpose |
 |---|---|
 | `main.py` | Entry point — creates the Tk root window and starts the app |
-| `gui.py` | Connect dialog, main window (Message tab + Command tab + Repeating panel), the shared `SearchablePicker` search/dropdown widget, dynamic parameter forms, send/log logic |
-| `mav_connection.py` | Wraps a `pymavlink` connection; runs the background heartbeat thread; thread-safe `send()` |
-| `mav_messages.py` | Reads message/field/command metadata off `pymavlink`'s ArduPilot dialect and builds/parses messages and commands from form input |
+| `gui.py` | Connect dialog, main window (Message tab + Command tab + Repeating panel + incoming-traffic controls), the shared `SearchablePicker` search/dropdown widget, dynamic parameter forms, send/receive/log logic |
+| `mav_connection.py` | Wraps a `pymavlink` connection; runs the background heartbeat and receive threads; thread-safe `send()`; the Windows UDP-client bind workaround |
+| `mav_messages.py` | Reads message/field/command metadata off `pymavlink`'s ArduPilot dialect and builds/parses messages, commands, and command acks from form input |
 | `repeat_manager.py` | One background thread per active repeat (rate, pause, send count, last error); independent of the connection's own heartbeat loop |
 
 ## Known limitations / ideas for v2
 
 - Commands only support `COMMAND_LONG`, not `COMMAND_INT` (which uses `x`/`y`/`z` + a coordinate frame instead of `param5`-`param7`, and is mainly used for guided-mode position commands). Repeating inherits this limitation too.
 - Bitmask fields are raw integer entry rather than a checkbox-per-flag UI.
-- No display of `COMMAND_ACK` or any other reply the GCS/MAVProxy might send back — this app only sends, it doesn't listen.
+- Auto-ACK only handles `COMMAND_LONG`; other request/response protocols a real GCS might expect (`PARAM_REQUEST_LIST`→`PARAM_VALUE` streaming, mission upload/download) aren't emulated, so GCS screens relying on those will still hang against this app.
 - Repeats don't survive a disconnect/reconnect (see "Repeating sends" above) — this was a deliberate v1 choice, not an oversight.
+- Incoming messages are only logged as text, not shown in a structured/filterable view — with a chatty GCS this can scroll fast (use **Clear Log**).
 
 ## A note on `pymavlink` field metadata
 

@@ -205,6 +205,7 @@ class App:
         self.conn_mgr = ConnectionManager()
         self.conn_mgr.on_status = self._threadsafe_log
         self.conn_mgr.on_disconnect = self._threadsafe_on_disconnect
+        self.conn_mgr.on_message = self._threadsafe_on_message
         self.repeat_mgr = RepeatManager(self.conn_mgr)
         self.repeat_status_vars = {}  # entry id -> StringVar, refreshed periodically
 
@@ -244,14 +245,22 @@ class App:
         notebook.add(cmd_tab, text="Command (MAV_CMD)")
         self._build_command_tab(cmd_tab)
 
-        repeat_frame = ttk.LabelFrame(self.root, text="Repeating", padding=(8, 4))
+        repeat_frame = ttk.Frame(self.root, padding=(8, 0))
         repeat_frame.pack(fill="x", padx=8, pady=(0, 4))
-        self.repeat_list = ScrollableFrame(repeat_frame, canvas_height=130)
+        self.repeat_expanded = False
+        self.repeat_count = 0
+        self.repeat_toggle_btn = ttk.Button(repeat_frame, command=self._toggle_repeat_panel)
+        self.repeat_toggle_btn.pack(fill="x")
+        self.repeat_list_frame = ttk.Frame(repeat_frame)  # shown/hidden by the toggle; not packed = collapsed
+        self.repeat_list = ScrollableFrame(self.repeat_list_frame, canvas_height=130)
         self.repeat_list.pack(fill="both", expand=True)
 
         log_frame = ttk.Frame(self.root, padding=(8, 0, 8, 8))
         log_frame.pack(fill="both", expand=False)
-        ttk.Label(log_frame, text="Log:").pack(anchor="w")
+        log_header = ttk.Frame(log_frame)
+        log_header.pack(fill="x")
+        ttk.Label(log_header, text="Log (SENT / RECV):").pack(side="left", anchor="w")
+        ttk.Button(log_header, text="Clear Log", command=self._clear_log).pack(side="right")
         self.log_text = tk.Text(log_frame, height=8, state="disabled", wrap="word")
         self.log_text.pack(fill="both", expand=True)
 
@@ -308,6 +317,18 @@ class App:
         self.cmd_repeat_rate_var, self.cmd_repeat_unit_var, self.cmd_repeat_btn = self._build_repeat_controls(
             bottom, self._on_start_command_repeat
         )
+
+        incoming = ttk.LabelFrame(parent, text="Incoming commands", padding=8)
+        incoming.pack(fill="x", padx=8, pady=(0, 8))
+        self.auto_ack_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(incoming, text="Auto-ACK incoming COMMAND_LONG with result:", variable=self.auto_ack_var).pack(
+            side="left"
+        )
+        result_options = [f"{val} - {name}" for val, name in mm.get_enum_options("MAV_RESULT")]
+        self.ack_result_var = tk.StringVar(value=result_options[0] if result_options else "0")
+        ttk.Combobox(
+            incoming, textvariable=self.ack_result_var, values=result_options, width=28, state="readonly"
+        ).pack(side="left", padx=(4, 0))
 
     @staticmethod
     def _build_repeat_controls(parent, start_command):
@@ -545,12 +566,29 @@ class App:
         )
 
     # ---- repeat: the shared "Repeating" panel ------------------------
+    def _toggle_repeat_panel(self):
+        self.repeat_expanded = not self.repeat_expanded
+        if self.repeat_expanded:
+            self.repeat_list_frame.pack(fill="both", expand=True, pady=(4, 0))
+        else:
+            self.repeat_list_frame.pack_forget()
+        self._update_repeat_header()
+
+    def _update_repeat_header(self):
+        arrow = "▼" if self.repeat_expanded else "▶"
+        text = f"{arrow} Repeating"
+        if self.repeat_count:
+            text += f" ({self.repeat_count} active)"
+        self.repeat_toggle_btn.configure(text=text)
+
     def _rebuild_repeat_rows(self):
         for child in self.repeat_list.inner.winfo_children():
             child.destroy()
         self.repeat_status_vars = {}
 
         entries = sorted(self.repeat_mgr.entries.values(), key=lambda e: e.id)
+        self.repeat_count = len(entries)
+        self._update_repeat_header()
         if not entries:
             ttk.Label(self.repeat_list.inner, text="(none - use \"Start Repeating\" on a tab above)", foreground="#888").grid(
                 row=0, column=0, sticky="w"
@@ -618,12 +656,43 @@ class App:
                 status_var.set("not sent yet")
         self.root.after(REPEAT_STATUS_REFRESH_MS, self._refresh_repeat_status)
 
+    # ---- incoming traffic ---------------------------------------------
+    def _threadsafe_on_message(self, msg):
+        self.root.after(0, lambda: self._handle_incoming_message(msg))
+
+    def _handle_incoming_message(self, msg):
+        self.log(
+            f"RECV {msg.get_type()} from sys{msg.get_srcSystem()}.comp{msg.get_srcComponent()}: "
+            f"{mm.format_incoming_message(msg)}"
+        )
+        if msg.get_type() == "COMMAND_LONG" and self.auto_ack_var.get():
+            self._send_auto_ack(msg)
+
+    def _send_auto_ack(self, command_long_msg):
+        result_value = int(self.ack_result_var.get().split(" - ", 1)[0])
+        ack = mm.build_command_ack(
+            command_long_msg.command, result_value, command_long_msg.get_srcSystem(), command_long_msg.get_srcComponent()
+        )
+        try:
+            self.conn_mgr.send(ack)
+        except Exception as exc:
+            self.log(f"Auto-ACK failed: {exc}")
+            return
+        cmd_name = mm.get_command_name(command_long_msg.command)
+        result_name = self.ack_result_var.get().split(" - ", 1)[1]
+        self.log(f"Auto-ACK sent for {cmd_name} ({command_long_msg.command}): {result_name}")
+
     # ---- logging ---------------------------------------------------
     def log(self, text):
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_text.configure(state="normal")
         self.log_text.insert("end", f"[{timestamp}] {text}\n")
         self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _clear_log(self):
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
 
     def _threadsafe_log(self, text):
