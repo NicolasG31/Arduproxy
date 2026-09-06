@@ -1,10 +1,13 @@
-"""Curated MAVLink message catalog and field (de)serialization helpers.
+"""MAVLink message/command catalog and field (de)serialization helpers.
 
 Built around pymavlink's ArduPilot dialect (v2.0), which is the dialect
 ArduPilot/SITL and MAVProxy use. Field metadata (names, C types, array
 lengths, associated enums) is read directly off the generated message
 classes so the GUI can build input forms without hardcoding per-message
-layouts.
+layouts. Every message in the dialect is exposed via MESSAGE_NAMES; MAV_CMD
+commands (sent as COMMAND_LONG) are exposed separately via
+get_command_options()/build_command_long(), since they need per-command
+param help text rather than generic field specs.
 """
 from collections import namedtuple
 
@@ -23,29 +26,14 @@ BITMASK_ENUM_NAMES = frozenset({
     "ESTIMATOR_STATUS_FLAGS",
 })
 
-CURATED_MESSAGES = [
-    "HEARTBEAT",
-    "SYS_STATUS",
-    "GPS_RAW_INT",
-    "GLOBAL_POSITION_INT",
-    "ATTITUDE",
-    "VFR_HUD",
-    "BATTERY_STATUS",
-    "STATUSTEXT",
-    "RC_CHANNELS",
-    "GPS_GLOBAL_ORIGIN",
-    "EKF_STATUS_REPORT",
-    "LOCAL_POSITION_NED",
-    "MISSION_CURRENT",
-    "HOME_POSITION",
-    "RANGEFINDER",
-]
-
 FieldSpec = namedtuple("FieldSpec", ["name", "ctype", "array_len", "enum_name"])
 
 _ALL_MESSAGES = {}
 for _cls in mavlink.mavlink_map.values():
     _ALL_MESSAGES[_cls.msgname] = _cls
+
+# Every message in the dialect, sorted by MAVLink message ID.
+MESSAGE_NAMES = sorted(_ALL_MESSAGES.keys(), key=lambda name: _ALL_MESSAGES[name].id)
 
 
 def get_message_class(msg_name):
@@ -96,6 +84,38 @@ def parse_scalar(ctype, text):
     if ctype in ("float", "double"):
         return float(text) if text else 0.0
     return int(text, 0) if text else 0  # base 0 allows hex like 0x05
+
+
+def get_command_options():
+    """Sorted list of (command_value, MAV_CMD_NAME) for every known command."""
+    return get_enum_options("MAV_CMD")
+
+
+def get_command_description(command_value):
+    entry = mavlink.enums["MAV_CMD"].get(command_value)
+    return entry.description if entry else ""
+
+
+def get_command_param_help(command_value):
+    """dict of {1..7: help text} for a MAV_CMD's param1..param7, as documented
+    in the MAVLink XML. Missing/unused params come back as an empty string."""
+    entry = mavlink.enums["MAV_CMD"].get(command_value)
+    param_help = dict(getattr(entry, "param", None) or {}) if entry else {}
+    return {i: param_help.get(i, "").strip() for i in range(1, 8)}
+
+
+def build_command_long(command_value, target_system, target_component, confirmation, params):
+    """params: sequence of 7 floats (param1..param7)."""
+    msg_cls = get_message_class("COMMAND_LONG")
+    kwargs = {
+        "target_system": target_system,
+        "target_component": target_component,
+        "command": command_value,
+        "confirmation": confirmation,
+    }
+    for i, value in enumerate(params, start=1):
+        kwargs[f"param{i}"] = value
+    return msg_cls(**kwargs)
 
 
 def build_message(msg_cls, field_specs, raw_values):
