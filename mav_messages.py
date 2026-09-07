@@ -11,9 +11,12 @@ param help text rather than generic field specs. build_command_ack() and
 format_incoming_message() support the GUI's incoming-message handling
 (logging + auto-ACK of commands received from MAVProxy/the GCS).
 """
+import re
 from collections import namedtuple
 
 from pymavlink.dialects.v20 import ardupilotmega as mavlink
+
+_INT_CTYPE_RE = re.compile(r"^(u?)int(8|16|32|64)_t$")
 
 # Enums that are bitmasks rather than single-value choices (e.g. combined
 # sensor/fault flags). A single-select dropdown doesn't fit these, so
@@ -92,11 +95,33 @@ def default_value_str(spec):
     return "0"
 
 
+def int_ctype_bits(ctype):
+    """Bit width of a fixed-width integer ctype (e.g. 32 for "int32_t" or
+    "uint32_t"), or None if ctype isn't one of those (float/double/char)."""
+    m = _INT_CTYPE_RE.match(ctype)
+    return int(m.group(2)) if m else None
+
+
+def wrap_int_to_ctype(value, ctype):
+    """Mask value down to ctype's bit width and, for signed ctypes, re-apply
+    two's complement - so typing the full raw bit pattern (e.g. 0xFFFFFFFF
+    for an int32_t field, to mean -1) works instead of struct.pack rejecting
+    it as out of range."""
+    bits = int_ctype_bits(ctype)
+    if bits is None:
+        return value
+    value &= (1 << bits) - 1
+    if ctype.startswith("int") and value & (1 << (bits - 1)):
+        value -= 1 << bits
+    return value
+
+
 def parse_scalar(ctype, text):
     text = text.strip()
     if ctype in ("float", "double"):
         return float(text) if text else 0.0
-    return int(text, 0) if text else 0  # base 0 allows hex like 0x05
+    value = int(text, 0) if text else 0  # base 0 allows hex like 0x05
+    return wrap_int_to_ctype(value, ctype)
 
 
 def get_command_options():

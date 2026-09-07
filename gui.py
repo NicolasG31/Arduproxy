@@ -279,6 +279,14 @@ class App:
         )
         self.msg_picker.pack(fill="x", padx=8, pady=8)
 
+        self.show_byte_editor_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            parent,
+            text="Show byte editor for integer fields",
+            variable=self.show_byte_editor_var,
+            command=self._on_message_selected,
+        ).pack(fill="x", padx=8)
+
         self.form_container = ScrollableFrame(parent, padding=8)
         self.form_container.pack(fill="both", expand=True, padx=8)
 
@@ -440,6 +448,8 @@ class App:
                 entry = ttk.Entry(self.form_container.inner, textvariable=var, width=42)
                 entry.grid(row=row, column=1, sticky="w", pady=2)
                 self.field_getters[spec.name] = var.get
+                if self.show_byte_editor_var.get() and not spec.array_len and mm.int_ctype_bits(spec.ctype) is not None:
+                    self._add_byte_editor(self.form_container.inner, row, spec.ctype, var)
 
     @staticmethod
     def _build_bitmask_checkboxes(parent, row, enum_name, cols=3):
@@ -459,6 +469,50 @@ class App:
             return str(sum(value for value, var in vars_by_value.items() if var.get()))
 
         return getter
+
+    @staticmethod
+    def _add_byte_editor(parent, row, ctype, var):
+        """A per-byte hex entry (00-FF, LSB first) next to a scalar integer
+        field's normal Entry, letting you set/inspect its raw wire bytes
+        directly - e.g. to test a specific bit pattern like 0xFFFFFFFF/-1 or
+        0x80000000/INT32_MIN in a signed field. "Apply" combines the bytes
+        and writes the result back into the field's own Entry (as the
+        two's-complement value for signed ctypes), so Send/Repeat use it
+        exactly as if it had been typed there directly."""
+        bits = mm.int_ctype_bits(ctype)
+        n_bytes = bits // 8
+        frame = ttk.Frame(parent)
+        frame.grid(row=row, column=2, sticky="w", padx=(8, 0))
+        ttk.Label(frame, text="bytes (hex, LSB first):").pack(side="left", padx=(0, 4))
+
+        try:
+            current = mm.wrap_int_to_ctype(mm.parse_scalar(ctype, var.get()), ctype)
+        except ValueError:
+            current = 0
+        unsigned = current & ((1 << bits) - 1)
+
+        byte_vars = []
+        for i in range(n_bytes):
+            byte_val = (unsigned >> (8 * i)) & 0xFF
+            bv = tk.StringVar(value=f"{byte_val:02X}")
+            byte_vars.append(bv)
+            ttk.Entry(frame, textvariable=bv, width=3).pack(side="left", padx=1)
+
+        def apply_bytes():
+            total = 0
+            for i, bv in enumerate(byte_vars):
+                try:
+                    byte_val = int(bv.get(), 16)
+                except ValueError:
+                    messagebox.showerror("Invalid byte", "Each byte must be a hex value 00-FF.")
+                    return
+                if not 0 <= byte_val <= 0xFF:
+                    messagebox.showerror("Invalid byte", "Each byte must be a hex value 00-FF.")
+                    return
+                total |= byte_val << (8 * i)
+            var.set(str(mm.wrap_int_to_ctype(total, ctype)))
+
+        ttk.Button(frame, text="Apply", command=apply_bytes).pack(side="left", padx=(4, 0))
 
     @staticmethod
     def _make_enum_getter(var):
