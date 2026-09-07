@@ -1,10 +1,12 @@
-"""Tkinter GUI: connect dialog + main window with three tabs -
+"""Tkinter GUI: connect dialog + main window with four tabs -
 "Message" (regular MAVLink telemetry/status messages), "Command (MAV_CMD)"
-(COMMAND_LONG), and "Params" (the vehicle's PARAM_VALUE table, served to the
-GCS's PARAM_REQUEST_LIST/READ/SET like a real autopilot's parameter store) -
-each with a searchable picker or table, and (for Message/Command) a
-dynamically generated parameter form and a repeat-send control; plus a
-shared "Repeating" panel and send log.
+(COMMAND_LONG), "Params" (the vehicle's PARAM_VALUE table, served to the
+GCS's PARAM_REQUEST_LIST/READ/SET like a real autopilot's parameter store),
+and "Processes" (start/stop SITL and MAVProxy as child processes, with their
+output, instead of separate terminal windows) - each with a searchable
+picker or table, and (for Message/Command) a dynamically generated
+parameter form and a repeat-send control; plus a shared "Repeating" panel
+and send log.
 """
 import itertools
 import time
@@ -15,6 +17,7 @@ from tkinter import messagebox, ttk
 import mav_messages as mm
 from mav_connection import ConnectionManager
 from param_store import DEFAULT_PARAM_TYPE, ParamStore
+from process_manager import ManagedProcess
 from repeat_manager import RepeatManager
 
 REPEAT_STATUS_REFRESH_MS = 500
@@ -222,13 +225,25 @@ class App:
         self.param_store = ParamStore()
         self._params_dirty = False  # set on incoming PARAM_VALUE, cleared by the periodic tree refresh
 
+        self.sitl_proc = ManagedProcess("SITL")
+        self.mavproxy_proc = ManagedProcess("MAVProxy")
+
         self._build_layout()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._update_connection_ui()
         self._on_message_selected()
         self._on_command_selected()
         self._rebuild_repeat_rows()
         self._refresh_repeat_status()
         self._refresh_param_tree_if_dirty()
+
+    def _on_close(self):
+        for proc in (self.sitl_proc, self.mavproxy_proc):
+            if proc.running:
+                proc.stop()
+        if self.conn_mgr.connected:
+            self.conn_mgr.disconnect()
+        self.root.destroy()
 
     # ---- layout -----------------------------------------------------
     def _build_layout(self):
@@ -269,6 +284,10 @@ class App:
         params_tab = ttk.Frame(notebook)
         notebook.add(params_tab, text="Params")
         self._build_params_tab(params_tab)
+
+        processes_tab = ttk.Frame(notebook)
+        notebook.add(processes_tab, text="Processes")
+        self._build_processes_tab(processes_tab)
 
         repeat_frame = ttk.Frame(self.root, padding=(8, 0))
         repeat_frame.pack(fill="x", padx=8, pady=(0, 4))
@@ -445,6 +464,96 @@ class App:
             btn_frame, text="Delete selected", command=self._on_delete_param_clicked, state="disabled"
         )
         self.param_delete_btn.pack(side="left", padx=(6, 0))
+
+    def _build_processes_tab(self, parent):
+        sitl_frame = ttk.LabelFrame(parent, text="SITL", padding=8)
+        sitl_frame.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+        self._wire_process_panel(sitl_frame, self.sitl_proc)
+
+        mavproxy_frame = ttk.LabelFrame(parent, text="MAVProxy", padding=8)
+        mavproxy_frame.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+        self._wire_process_panel(mavproxy_frame, self.mavproxy_proc)
+
+    def _wire_process_panel(self, frame, proc):
+        """Builds one process panel (command entry, Start/Stop, status,
+        output console) and wires it to the given ManagedProcess. Used for
+        both the SITL and MAVProxy panels, which are otherwise identical."""
+        cmd_row = ttk.Frame(frame)
+        cmd_row.pack(fill="x")
+        ttk.Label(cmd_row, text="Command:").pack(side="left")
+        cmd_var = tk.StringVar(value="")
+        ttk.Entry(cmd_row, textvariable=cmd_var).pack(side="left", fill="x", expand=True, padx=(4, 8))
+        start_btn = ttk.Button(cmd_row, text="Start")
+        start_btn.pack(side="left")
+        stop_btn = ttk.Button(cmd_row, text="Stop", state="disabled")
+        stop_btn.pack(side="left", padx=(4, 0))
+
+        status_var = tk.StringVar(value="Stopped")
+        ttk.Label(frame, textvariable=status_var, foreground="#555").pack(fill="x", pady=(4, 4))
+
+        output_frame = ttk.Frame(frame)
+        output_frame.pack(fill="both", expand=True)
+        output_text = tk.Text(output_frame, height=8, state="disabled", wrap="word")
+        output_scroll = ttk.Scrollbar(output_frame, orient="vertical", command=output_text.yview)
+        output_text.configure(yscrollcommand=output_scroll.set)
+        output_text.pack(side="left", fill="both", expand=True)
+        output_scroll.pack(side="left", fill="y")
+
+        ttk.Button(
+            frame, text="Clear Output", command=lambda: self._clear_process_output(output_text)
+        ).pack(anchor="e", pady=(4, 0))
+
+        def append_output(line):
+            output_text.configure(state="normal")
+            output_text.insert("end", line + "\n")
+            output_text.see("end")
+            output_text.configure(state="disabled")
+
+        def on_output(line):
+            self.root.after(0, append_output, line)
+
+        def on_exit(returncode):
+            def handle():
+                status_var.set(f"Exited (code {returncode})")
+                start_btn.configure(state="normal")
+                stop_btn.configure(state="disabled")
+                self.log(f"{proc.name} exited (code {returncode})")
+
+            self.root.after(0, handle)
+
+        proc.on_output = on_output
+        proc.on_exit = on_exit
+
+        def do_start():
+            command = cmd_var.get().strip()
+            if not command:
+                messagebox.showerror("No command", f"Enter a command to start {proc.name}.")
+                return
+            try:
+                proc.start(command)
+            except Exception as exc:
+                messagebox.showerror("Start failed", str(exc))
+                return
+            status_var.set(f"Running (PID {proc.pid})")
+            start_btn.configure(state="disabled")
+            stop_btn.configure(state="normal")
+            self.log(f"Started {proc.name}: {command}")
+
+        def do_stop():
+            proc.stop()
+            status_var.set("Stopped")
+            start_btn.configure(state="normal")
+            stop_btn.configure(state="disabled")
+            self.log(f"Stopped {proc.name}")
+
+        start_btn.configure(command=do_start)
+        stop_btn.configure(command=do_stop)
+
+    @staticmethod
+    def _clear_process_output(output_text):
+        output_text.configure(state="normal")
+        output_text.delete("1.0", "end")
+        output_text.configure(state="disabled")
 
     @staticmethod
     def _build_repeat_controls(parent, start_command):

@@ -10,15 +10,26 @@ A small Tkinter + pymavlink GUI app for testing a Ground Control Station (GCS). 
 
 - The app opens a MAVLink connection (UDP/TCP/serial) using `pymavlink`, in the role of the vehicle — it sets its own `source_system` / `source_component` on outgoing packets.
 - Once connected, it sends a `HEARTBEAT` message once per second on a background thread. Most GCS software (Mission Planner, QGroundControl, etc.) only considers a link "connected" once heartbeats start arriving, so this happens automatically and independently of anything else you send. The **"Send background heartbeat"** checkbox in the top bar (checked by default, toggleable whether connected or not) turns this off — useful if MAVProxy also has a real vehicle/SITL wired in as another master, since its HEARTBEAT already reaches the GCS and a second, differently-stated ~1Hz HEARTBEAT stream from this app will make the GCS flap between the two (e.g. mode/armed state changing every ~0.5s). Turn it off in that setup and rely on the real vehicle's heartbeat; turn it on when this app is standing in for the vehicle by itself.
-- The window has three tabs:
+- The window has four tabs:
   - **Message** — pick any regular MAVLink message from a dropdown, shown as `ID - NAME` (e.g. `0 - HEARTBEAT`), fill in its fields in a form generated on the fly from `pymavlink`'s message definitions (so field names, types, and valid enum values always match what `pymavlink` actually supports), and click **Send** to fire it once.
   - **Command (MAV_CMD)** — pick any MAV_CMD command (e.g. `400 - MAV_CMD_COMPONENT_ARM_DISARM`), shown with its real description and per-parameter help text pulled straight from the MAVLink XML (so you know what `param1`..`param7` actually mean for that specific command), set the target system/component and confirmation, and click **Send Command** to fire it as a `COMMAND_LONG`.
   - **Params** — a table of vehicle parameters this app answers the GCS's parameter protocol with, as if it were the autopilot's own parameter store; see "Vehicle parameters" below.
+  - **Processes** — start/stop SITL and MAVProxy as child processes of this app, with their console output, instead of juggling separate terminal windows; see "Managing SITL and MAVProxy" below.
   - The Message and Command pickers each have a **Search** box that filters the dropdown live as you type, matching either a substring of the name or its numeric ID (e.g. typing `24` narrows the message picker to `GPS_RAW_INT`, whose ID is 24; typing `arm` narrows the command picker to `MAV_CMD_COMPONENT_ARM_DISARM`). If the current selection falls out of the filtered results, the picker jumps to the first match automatically; clearing the search restores the full list; if nothing matches, the dropdown empties but the current selection and form are left alone.
   - Next to **Send** / **Send Command** is a **"Repeat every: [rate] [s/Hz] [Start Repeating]"** control — fill in a message/command's fields as usual, pick a rate (either an interval in seconds like `0.5`, or a frequency in Hz like `2`), and click it to have that exact message/command resent on a background timer instead of just once.
 - Every active repeat shows up in the **▶ Repeating** panel below the tabs (visible regardless of which tab is active) — collapsed by default, showing just a count (e.g. `▶ Repeating (2 active)`); click it to expand and see each entry, with its rate editable in place, a **Pause**/**Resume** toggle, a **Remove** button, and a live status line (send count and time since last send, or the last error if sends started failing).
 - MAVProxy receives these packets on its input link and forwards them to every output it's configured with — including your real GCS connection — exactly as if they'd come from the vehicle.
 - The app also **listens**: anything MAVProxy forwards back down that same link — e.g. a `COMMAND_LONG` your GCS issues (arm, mode change, takeoff, ...), or telemetry from a real SITL vehicle also wired into MAVProxy — is logged as a `RECV[GCS]` or `RECV[SITL]` line (see "Listening and auto-ACK" below for how that's decided). By default it also **auto-replies with `COMMAND_ACK`** to any incoming `COMMAND_LONG`, via the **"Incoming commands"** controls at the bottom of the **Command (MAV_CMD)** tab (checkbox + result dropdown) — without this, GCS actions that wait for an acknowledgement would just hang against this app instead of showing you a reaction.
+
+### Managing SITL and MAVProxy
+
+Instead of running SITL and MAVProxy in their own terminal windows, the **Processes** tab has one panel each for **SITL** and **MAVProxy**:
+
+- **Command:** paste in whatever command you'd normally type in a terminal to launch that process — it's run exactly as typed via `cmd.exe` (`subprocess.Popen(..., shell=True)`), so anything that works in a terminal works here too, including a `wsl ...` invocation if you run SITL under WSL. There's no default filled in, since the right command depends entirely on your setup (paths to your ArduPilot checkout, vehicle type, WSL distro, etc.) — see the quickstart's `mavproxy.py --master=...` example for the MAVProxy side.
+- **Start** launches it and begins streaming its stdout/stderr into the console box below, live; **Stop** force-kills it (and everything it spawned — see below) and is only enabled while it's running. The status line shows `Running (PID ...)` or `Exited (code ...)`.
+- **Stop** uses `taskkill /PID <pid> /T /F` rather than a graceful signal: since the command runs through a `cmd.exe` wrapper, closing just that wrapper (what a plain "terminate" would do) would leave the real SITL/MAVProxy process orphaned and still running — `/T` kills the whole tree it spawned. Neither of these tools needs a graceful shutdown handshake, so this is deliberately blunt rather than polite.
+- Closing the app window stops both processes automatically (along with disconnecting the MAVLink connection, if one is open), so you don't end up with an orphaned SITL/MAVProxy still running in the background after the GUI closes.
+- Each panel's **Clear Output** button clears just that panel's console; SITL and MAVProxy's outputs are independent (starting/stopping one never touches the other).
 
 ### Connecting to MAVProxy
 
@@ -128,10 +139,11 @@ Any message or command can be sent on a repeating timer instead of once:
 | File | Purpose |
 |---|---|
 | `main.py` | Entry point — creates the Tk root window and starts the app |
-| `gui.py` | Connect dialog, main window (Message tab + Command tab + Params tab + Repeating panel + incoming-traffic controls), the shared `SearchablePicker` search/dropdown widget, dynamic parameter forms, send/receive/log logic |
+| `gui.py` | Connect dialog, main window (Message tab + Command tab + Params tab + Processes tab + Repeating panel + incoming-traffic controls), the shared `SearchablePicker` search/dropdown widget, dynamic parameter forms, send/receive/log logic |
 | `mav_connection.py` | Wraps a `pymavlink` connection; runs the background heartbeat and receive threads; thread-safe `send()`; the Windows UDP-client bind workaround |
 | `mav_messages.py` | Reads message/field/command metadata off `pymavlink`'s ArduPilot dialect and builds/parses messages, commands, and command acks from form input |
 | `param_store.py` | In-memory vehicle parameter table (name/value/type) and the `PARAM_VALUE` message-building side of the parameter protocol; `gui.py` handles the request/response side (`PARAM_REQUEST_LIST`/`PARAM_REQUEST_READ`/`PARAM_SET`) |
+| `process_manager.py` | Launches and supervises an arbitrary shell command as a child process (SITL/MAVProxy), streaming its output back and force-killing its whole process tree on stop |
 | `repeat_manager.py` | One background thread per active repeat (rate, pause, send count, last error); independent of the connection's own heartbeat loop |
 
 ## Known limitations / ideas for v2
@@ -141,6 +153,7 @@ Any message or command can be sent on a repeating timer instead of once:
 - The Params tab has no per-parameter metadata (min/max, reboot-required, description) and doesn't support renaming a parameter in place (delete the old entry and add the new name instead).
 - Repeats don't survive a disconnect/reconnect (see "Repeating sends" above) — this was a deliberate v1 choice, not an oversight.
 - Incoming messages are only logged as colored, filterable text (see "Listening and auto-ACK" above) — not a structured/sortable table, and there's no graphing of a field's value over time yet.
+- The Processes tab is Windows-only as written (`taskkill` for stopping, `cmd.exe` via `shell=True` for running the command) and remembers nothing between runs — the command fields start empty every time the app opens, and there's no way to save a command you use often.
 
 ## A note on `pymavlink` field metadata
 
