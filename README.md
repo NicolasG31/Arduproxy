@@ -10,10 +10,11 @@ A small Tkinter + pymavlink GUI app for testing a Ground Control Station (GCS). 
 
 - The app opens a MAVLink connection (UDP/TCP/serial) using `pymavlink`, in the role of the vehicle — it sets its own `source_system` / `source_component` on outgoing packets.
 - Once connected, it sends a `HEARTBEAT` message once per second on a background thread. Most GCS software (Mission Planner, QGroundControl, etc.) only considers a link "connected" once heartbeats start arriving, so this happens automatically and independently of anything else you send. The **"Send background heartbeat"** checkbox in the top bar (checked by default, toggleable whether connected or not) turns this off — useful if MAVProxy also has a real vehicle/SITL wired in as another master, since its HEARTBEAT already reaches the GCS and a second, differently-stated ~1Hz HEARTBEAT stream from this app will make the GCS flap between the two (e.g. mode/armed state changing every ~0.5s). Turn it off in that setup and rely on the real vehicle's heartbeat; turn it on when this app is standing in for the vehicle by itself.
-- The window has two tabs:
+- The window has three tabs:
   - **Message** — pick any regular MAVLink message from a dropdown, shown as `ID - NAME` (e.g. `0 - HEARTBEAT`), fill in its fields in a form generated on the fly from `pymavlink`'s message definitions (so field names, types, and valid enum values always match what `pymavlink` actually supports), and click **Send** to fire it once.
   - **Command (MAV_CMD)** — pick any MAV_CMD command (e.g. `400 - MAV_CMD_COMPONENT_ARM_DISARM`), shown with its real description and per-parameter help text pulled straight from the MAVLink XML (so you know what `param1`..`param7` actually mean for that specific command), set the target system/component and confirmation, and click **Send Command** to fire it as a `COMMAND_LONG`.
-  - Both pickers have a **Search** box that filters the dropdown live as you type, matching either a substring of the name or its numeric ID (e.g. typing `24` narrows the message picker to `GPS_RAW_INT`, whose ID is 24; typing `arm` narrows the command picker to `MAV_CMD_COMPONENT_ARM_DISARM`). If the current selection falls out of the filtered results, the picker jumps to the first match automatically; clearing the search restores the full list; if nothing matches, the dropdown empties but the current selection and form are left alone.
+  - **Params** — a table of vehicle parameters this app answers the GCS's parameter protocol with, as if it were the autopilot's own parameter store; see "Vehicle parameters" below.
+  - The Message and Command pickers each have a **Search** box that filters the dropdown live as you type, matching either a substring of the name or its numeric ID (e.g. typing `24` narrows the message picker to `GPS_RAW_INT`, whose ID is 24; typing `arm` narrows the command picker to `MAV_CMD_COMPONENT_ARM_DISARM`). If the current selection falls out of the filtered results, the picker jumps to the first match automatically; clearing the search restores the full list; if nothing matches, the dropdown empties but the current selection and form are left alone.
   - Next to **Send** / **Send Command** is a **"Repeat every: [rate] [s/Hz] [Start Repeating]"** control — fill in a message/command's fields as usual, pick a rate (either an interval in seconds like `0.5`, or a frequency in Hz like `2`), and click it to have that exact message/command resent on a background timer instead of just once.
 - Every active repeat shows up in the **▶ Repeating** panel below the tabs (visible regardless of which tab is active) — collapsed by default, showing just a count (e.g. `▶ Repeating (2 active)`); click it to expand and see each entry, with its rate editable in place, a **Pause**/**Resume** toggle, a **Remove** button, and a live status line (send count and time since last send, or the last error if sends started failing).
 - MAVProxy receives these packets on its input link and forwards them to every output it's configured with — including your real GCS connection — exactly as if they'd come from the vehicle.
@@ -70,6 +71,8 @@ Other supported forms:
 
 8. **See it listen:** trigger anything in your real GCS that sends a command to the vehicle (e.g. its arm button). You should see a `RECV[GCS] COMMAND_LONG ...` line in the log almost immediately followed by `Auto-ACK sent for ...`, and your GCS should show the command as accepted instead of timing out.
 
+9. **Try the parameter store:** on the **Params** tab, click **Retrieve from SITL** to pull in the real vehicle's current parameters (if one's attached), or add one by hand (e.g. Name `BATT_LOW_VOLT`, Value `10.5`, click **Set (add/update)**). In your GCS, open its parameter list / refresh parameters screen — it should populate from this table instead of hanging, and changing a value there and writing it should show up back in the table here.
+
 ## Listening and auto-ACK
 
 The app doesn't just send — the same link is read continuously in the background:
@@ -83,6 +86,16 @@ The app doesn't just send — the same link is read continuously in the backgrou
 ### A Windows-specific gotcha we hit building this
 
 pymavlink's UDP *client* sockets (`udpout:`, or `udp:` without `input=True`) are only bound to a local port implicitly, by the OS, on their first outgoing `sendto()`. On Windows, calling `recvfrom()` on the socket before that first send has happened raises `WSAEINVAL` ("An invalid argument was supplied") — and since the receive thread and the heartbeat thread both start immediately on connect, the receive thread could win that race. `mav_connection._bind_udp_client_socket()` binds the socket explicitly and synchronously right after connecting, before either thread touches it, closing the race. This only matters for UDP client mode; UDP server (`udpin:`) and other connection types were never affected.
+
+## Vehicle parameters
+
+The **Params** tab lets this app answer the MAVLink parameter protocol as if it were the autopilot's own parameter store — the same idea as auto-ACK, but for a GCS's "refresh parameters" / "write parameters" screens instead of its command screens:
+
+- **The table** shows every known parameter as `Name | Value | Type`. Use the **Name**/**Value**/**Type** fields and **"Set (add/update)"** button below it to add a new parameter or edit an existing one (typing an existing name updates it in place); select a row to load it into those fields, then **"Delete selected"** to remove it. A **Filter** box above the table narrows it live by name substring — useful once you've retrieved a real vehicle's full parameter set (ArduCopter alone has over a thousand).
+- **"Retrieve from SITL"** sends a `PARAM_REQUEST_LIST` (addressed to the **Target sysid**/**compid** fields next to the button, default `1`/`1`) out on the link. Any `PARAM_VALUE` that comes back — from a real SITL/vehicle also wired into MAVProxy — is merged into the table (new parameters added, existing ones updated), so you can start editing from a realistic baseline instead of typing every parameter by hand. This only *reads* from the real vehicle; it never writes anything back to it.
+- **"Respond to PARAM_REQUEST_LIST / PARAM_REQUEST_READ / PARAM_SET from GCS"** (checked by default) makes the table live: when ticked, the app answers the GCS's own parameter requests using this table — a `PARAM_REQUEST_LIST` gets every row back as a `PARAM_VALUE` stream, a `PARAM_REQUEST_READ` (by name or by index) gets the one matching row, and a `PARAM_SET` updates the matching row (adding it if it didn't already exist) and is acknowledged with a `PARAM_VALUE` reflecting the new value — real autopilots don't reject a `PARAM_SET`, they just report back whatever value they actually stored, and this app does the same. Uncheck it to test what your GCS does when the parameter protocol never responds.
+- A parameter's `param_value` is always sent as its plain numeric value in the wire message's float field (the ArduPilot/QGroundControl "cast" convention — a `param_type` of `INT32` with value `5` is transmitted as the float `5.0`, not a bit-reinterpretation of the integer `5`); `param_type` only tells the GCS how to label/display it.
+- There's no per-parameter metadata (min/max/increment, reboot-required, the `.pdef.xml`-style description ArduPilot ships) — just name, value, and type. Mission upload/download (`MISSION_REQUEST_LIST` etc.) still isn't emulated either.
 
 ## Repeating sends
 
@@ -115,15 +128,17 @@ Any message or command can be sent on a repeating timer instead of once:
 | File | Purpose |
 |---|---|
 | `main.py` | Entry point — creates the Tk root window and starts the app |
-| `gui.py` | Connect dialog, main window (Message tab + Command tab + Repeating panel + incoming-traffic controls), the shared `SearchablePicker` search/dropdown widget, dynamic parameter forms, send/receive/log logic |
+| `gui.py` | Connect dialog, main window (Message tab + Command tab + Params tab + Repeating panel + incoming-traffic controls), the shared `SearchablePicker` search/dropdown widget, dynamic parameter forms, send/receive/log logic |
 | `mav_connection.py` | Wraps a `pymavlink` connection; runs the background heartbeat and receive threads; thread-safe `send()`; the Windows UDP-client bind workaround |
 | `mav_messages.py` | Reads message/field/command metadata off `pymavlink`'s ArduPilot dialect and builds/parses messages, commands, and command acks from form input |
+| `param_store.py` | In-memory vehicle parameter table (name/value/type) and the `PARAM_VALUE` message-building side of the parameter protocol; `gui.py` handles the request/response side (`PARAM_REQUEST_LIST`/`PARAM_REQUEST_READ`/`PARAM_SET`) |
 | `repeat_manager.py` | One background thread per active repeat (rate, pause, send count, last error); independent of the connection's own heartbeat loop |
 
 ## Known limitations / ideas for v2
 
 - Commands only support `COMMAND_LONG`, not `COMMAND_INT` (which uses `x`/`y`/`z` + a coordinate frame instead of `param5`-`param7`, and is mainly used for guided-mode position commands). Repeating inherits this limitation too.
-- Auto-ACK only handles `COMMAND_LONG`; other request/response protocols a real GCS might expect (`PARAM_REQUEST_LIST`→`PARAM_VALUE` streaming, mission upload/download) aren't emulated, so GCS screens relying on those will still hang against this app.
+- Auto-ACK only handles `COMMAND_LONG`; the parameter protocol is now emulated (see "Vehicle parameters" above), but other request/response protocols a real GCS might expect (mission upload/download, `PARAM_REQUEST_LIST` paced/rate-limited like a real link instead of sent as a burst) aren't.
+- The Params tab has no per-parameter metadata (min/max, reboot-required, description) and doesn't support renaming a parameter in place (delete the old entry and add the new name instead).
 - Repeats don't survive a disconnect/reconnect (see "Repeating sends" above) — this was a deliberate v1 choice, not an oversight.
 - Incoming messages are only logged as colored, filterable text (see "Listening and auto-ACK" above) — not a structured/sortable table, and there's no graphing of a field's value over time yet.
 

@@ -1,7 +1,9 @@
-"""Tkinter GUI: connect dialog + main window with two tabs -
-"Message" (regular MAVLink telemetry/status messages) and
-"Command (MAV_CMD)" (COMMAND_LONG) - each with a searchable picker,
-a dynamically generated parameter form, and a repeat-send control; plus a
+"""Tkinter GUI: connect dialog + main window with three tabs -
+"Message" (regular MAVLink telemetry/status messages), "Command (MAV_CMD)"
+(COMMAND_LONG), and "Params" (the vehicle's PARAM_VALUE table, served to the
+GCS's PARAM_REQUEST_LIST/READ/SET like a real autopilot's parameter store) -
+each with a searchable picker or table, and (for Message/Command) a
+dynamically generated parameter form and a repeat-send control; plus a
 shared "Repeating" panel and send log.
 """
 import itertools
@@ -12,9 +14,11 @@ from tkinter import messagebox, ttk
 
 import mav_messages as mm
 from mav_connection import ConnectionManager
+from param_store import DEFAULT_PARAM_TYPE, ParamStore
 from repeat_manager import RepeatManager
 
 REPEAT_STATUS_REFRESH_MS = 500
+PARAM_TREE_REFRESH_MS = 300
 
 DEFAULT_CONN_STRING = "udpout:127.0.0.1:14550"
 
@@ -215,12 +219,16 @@ class App:
         self.cmd_field_getters = {}  # "param1".."param7" -> callable returning raw string
         self.current_cmd_value = None
 
+        self.param_store = ParamStore()
+        self._params_dirty = False  # set on incoming PARAM_VALUE, cleared by the periodic tree refresh
+
         self._build_layout()
         self._update_connection_ui()
         self._on_message_selected()
         self._on_command_selected()
         self._rebuild_repeat_rows()
         self._refresh_repeat_status()
+        self._refresh_param_tree_if_dirty()
 
     # ---- layout -----------------------------------------------------
     def _build_layout(self):
@@ -257,6 +265,10 @@ class App:
         cmd_tab = ttk.Frame(notebook)
         notebook.add(cmd_tab, text="Command (MAV_CMD)")
         self._build_command_tab(cmd_tab)
+
+        params_tab = ttk.Frame(notebook)
+        notebook.add(params_tab, text="Params")
+        self._build_params_tab(params_tab)
 
         repeat_frame = ttk.Frame(self.root, padding=(8, 0))
         repeat_frame.pack(fill="x", padx=8, pady=(0, 4))
@@ -358,6 +370,81 @@ class App:
         ttk.Combobox(
             incoming, textvariable=self.ack_result_var, values=result_options, width=28, state="readonly"
         ).pack(side="left", padx=(4, 0))
+
+    def _build_params_tab(self, parent):
+        top = ttk.Frame(parent, padding=8)
+        top.pack(fill="x")
+        ttk.Button(top, text="Retrieve from SITL", command=self._on_retrieve_params_clicked).pack(side="left")
+        ttk.Label(top, text="Target sysid:").pack(side="left", padx=(12, 2))
+        self.param_target_system_var = tk.StringVar(value="1")
+        ttk.Entry(top, textvariable=self.param_target_system_var, width=5).pack(side="left")
+        ttk.Label(top, text="compid:").pack(side="left", padx=(8, 2))
+        self.param_target_component_var = tk.StringVar(value="1")
+        ttk.Entry(top, textvariable=self.param_target_component_var, width=5).pack(side="left")
+        self.param_status_var = tk.StringVar(value="0 parameter(s)")
+        ttk.Label(top, textvariable=self.param_status_var, foreground="#555").pack(side="left", padx=(12, 0))
+
+        self.param_respond_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            parent,
+            text="Respond to PARAM_REQUEST_LIST / PARAM_REQUEST_READ / PARAM_SET from GCS",
+            variable=self.param_respond_var,
+        ).pack(fill="x", padx=8)
+
+        filter_frame = ttk.Frame(parent, padding=8)
+        filter_frame.pack(fill="x")
+        ttk.Label(filter_frame, text="Filter:").pack(side="left")
+        self.param_filter_var = tk.StringVar(value="")
+        ttk.Entry(filter_frame, textvariable=self.param_filter_var, width=24).pack(side="left", padx=(4, 0))
+        self.param_filter_var.trace_add("write", lambda *args: self._refresh_param_tree())
+
+        tree_frame = ttk.Frame(parent, padding=(8, 0))
+        tree_frame.pack(fill="both", expand=True)
+        self.param_tree = ttk.Treeview(
+            tree_frame, columns=("value", "type"), show="tree headings", selectmode="browse", height=14
+        )
+        self.param_tree.heading("#0", text="Name")
+        self.param_tree.heading("value", text="Value")
+        self.param_tree.heading("type", text="Type")
+        self.param_tree.column("#0", width=200, anchor="w")
+        self.param_tree.column("value", width=120, anchor="w")
+        self.param_tree.column("type", width=280, anchor="w")
+        tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.param_tree.yview)
+        self.param_tree.configure(yscrollcommand=tree_scroll.set)
+        self.param_tree.pack(side="left", fill="both", expand=True)
+        tree_scroll.pack(side="left", fill="y")
+        self.param_tree.bind("<<TreeviewSelect>>", self._on_param_tree_selected)
+
+        edit_frame = ttk.Frame(parent, padding=8)
+        edit_frame.pack(fill="x")
+        ttk.Label(edit_frame, text="Name:").grid(row=0, column=0, sticky="w")
+        self.param_name_var = tk.StringVar(value="")
+        ttk.Entry(edit_frame, textvariable=self.param_name_var, width=18).grid(
+            row=0, column=1, sticky="w", padx=(4, 12)
+        )
+        ttk.Label(edit_frame, text="Value:").grid(row=0, column=2, sticky="w")
+        self.param_value_var = tk.StringVar(value="0")
+        ttk.Entry(edit_frame, textvariable=self.param_value_var, width=14).grid(
+            row=0, column=3, sticky="w", padx=(4, 12)
+        )
+        ttk.Label(edit_frame, text="Type:").grid(row=0, column=4, sticky="w")
+        type_options = [f"{val} - {name}" for val, name in mm.get_enum_options("MAV_PARAM_TYPE")]
+        default_type_label = next(
+            (opt for opt in type_options if opt.startswith(f"{DEFAULT_PARAM_TYPE} - ")),
+            type_options[0] if type_options else "0",
+        )
+        self.param_type_var = tk.StringVar(value=default_type_label)
+        ttk.Combobox(
+            edit_frame, textvariable=self.param_type_var, values=type_options, width=30, state="readonly"
+        ).grid(row=0, column=5, sticky="w", padx=(4, 0))
+
+        btn_frame = ttk.Frame(parent, padding=(8, 0, 8, 8))
+        btn_frame.pack(fill="x")
+        ttk.Button(btn_frame, text="Set (add/update)", command=self._on_set_param_clicked).pack(side="left")
+        self.param_delete_btn = ttk.Button(
+            btn_frame, text="Delete selected", command=self._on_delete_param_clicked, state="disabled"
+        )
+        self.param_delete_btn.pack(side="left", padx=(6, 0))
 
     @staticmethod
     def _build_repeat_controls(parent, start_command):
@@ -800,8 +887,18 @@ class App:
             f"{mm.format_incoming_message(msg)}",
             kind=kind,
         )
-        if msg.get_type() == "COMMAND_LONG" and self.auto_ack_var.get():
+        msg_type = msg.get_type()
+        if msg_type == "COMMAND_LONG" and self.auto_ack_var.get():
             self._send_auto_ack(msg)
+        elif msg_type == "PARAM_REQUEST_LIST":
+            self._handle_param_request_list(msg)
+        elif msg_type == "PARAM_REQUEST_READ":
+            self._handle_param_request_read(msg)
+        elif msg_type == "PARAM_SET":
+            self._handle_param_set(msg)
+        elif msg_type == "PARAM_VALUE":
+            self.param_store.set(msg.param_id, msg.param_value, msg.param_type)
+            self._params_dirty = True
 
     def _send_auto_ack(self, command_long_msg):
         result_value = int(self.ack_result_var.get().split(" - ", 1)[0])
@@ -816,6 +913,137 @@ class App:
         cmd_name = mm.get_command_name(command_long_msg.command)
         result_name = self.ack_result_var.get().split(" - ", 1)[1]
         self.log(f"Auto-ACK sent for {cmd_name} ({command_long_msg.command}): {result_name}", kind="sent")
+
+    # ---- params tab: vehicle-side PARAM protocol -----------------------
+    def _handle_param_request_list(self, msg):
+        if not self.param_respond_var.get():
+            return
+        values = self.param_store.build_all_param_values()
+        for param_value_msg in values:
+            try:
+                self.conn_mgr.send(param_value_msg)
+            except Exception as exc:
+                self.log(f"PARAM_VALUE send failed: {exc}")
+                return
+        self.log(
+            f"Sent {len(values)} PARAM_VALUE (list) to sys{msg.get_srcSystem()}.comp{msg.get_srcComponent()}",
+            kind="sent",
+        )
+
+    def _handle_param_request_read(self, msg):
+        if not self.param_respond_var.get():
+            return
+        name = msg.param_id if msg.param_index < 0 else self.param_store.name_at(msg.param_index)
+        param_value_msg = self.param_store.build_param_value(name) if name else None
+        if param_value_msg is None:
+            self.log(f"PARAM_REQUEST_READ for unknown param {name!r} - no reply sent")
+            return
+        try:
+            self.conn_mgr.send(param_value_msg)
+        except Exception as exc:
+            self.log(f"PARAM_VALUE send failed: {exc}")
+            return
+        self.log(
+            f"Sent PARAM_VALUE {name} = {param_value_msg.param_value} to "
+            f"sys{msg.get_srcSystem()}.comp{msg.get_srcComponent()}",
+            kind="sent",
+        )
+
+    def _handle_param_set(self, msg):
+        if not self.param_respond_var.get():
+            return
+        name = self.param_store.set(msg.param_id, msg.param_value, msg.param_type)
+        self._refresh_param_tree()
+        param_value_msg = self.param_store.build_param_value(name)
+        try:
+            self.conn_mgr.send(param_value_msg)
+        except Exception as exc:
+            self.log(f"PARAM_VALUE send failed: {exc}")
+            return
+        self.log(
+            f"PARAM_SET {name} = {msg.param_value} accepted; sent PARAM_VALUE ack to "
+            f"sys{msg.get_srcSystem()}.comp{msg.get_srcComponent()}",
+            kind="sent",
+        )
+
+    def _on_retrieve_params_clicked(self):
+        try:
+            target_system = int(self.param_target_system_var.get())
+            target_component = int(self.param_target_component_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid target", "Target sysid/compid must be integers.")
+            return
+        msg = mm.get_message_class("PARAM_REQUEST_LIST")(
+            target_system=target_system, target_component=target_component
+        )
+        try:
+            self.conn_mgr.send(msg)
+        except Exception as exc:
+            messagebox.showerror("Send failed", str(exc))
+            return
+        self.log(f"Sent PARAM_REQUEST_LIST to sys{target_system}.comp{target_component}", kind="sent")
+
+    def _on_param_tree_selected(self, event=None):
+        selection = self.param_tree.selection()
+        if not selection:
+            self.param_delete_btn.configure(state="disabled")
+            return
+        name = selection[0]
+        entry = self.param_store.get(name)
+        if entry is None:
+            return
+        self.param_name_var.set(name)
+        self.param_value_var.set(str(entry["value"]))
+        type_options = [f"{val} - {enum_name}" for val, enum_name in mm.get_enum_options("MAV_PARAM_TYPE")]
+        match = next((opt for opt in type_options if opt.startswith(f"{entry['type']} - ")), None)
+        if match:
+            self.param_type_var.set(match)
+        self.param_delete_btn.configure(state="normal")
+
+    def _on_set_param_clicked(self):
+        name = self.param_name_var.get().strip()
+        if not name:
+            messagebox.showerror("Invalid parameter", "Name is required.")
+            return
+        try:
+            value = float(self.param_value_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid parameter", "Value must be a number.")
+            return
+        param_type = int(self.param_type_var.get().split(" - ", 1)[0])
+        stored_name = self.param_store.set(name, value, param_type)
+        self._refresh_param_tree()
+        if self.param_tree.exists(stored_name):
+            self.param_tree.selection_set(stored_name)
+            self.param_tree.see(stored_name)
+        self.log(f"Param set locally: {stored_name} = {value}")
+
+    def _on_delete_param_clicked(self):
+        selection = self.param_tree.selection()
+        if not selection:
+            return
+        name = selection[0]
+        self.param_store.remove(name)
+        self._refresh_param_tree()
+        self.param_name_var.set("")
+        self.param_delete_btn.configure(state="disabled")
+
+    def _refresh_param_tree(self):
+        query = self.param_filter_var.get().strip().lower()
+        self.param_tree.delete(*self.param_tree.get_children())
+        type_names = dict(mm.get_enum_options("MAV_PARAM_TYPE"))
+        for name, entry in self.param_store.items():
+            if query and query not in name.lower():
+                continue
+            type_label = f"{entry['type']} - {type_names.get(entry['type'], '?')}"
+            self.param_tree.insert("", "end", iid=name, text=name, values=(entry["value"], type_label))
+        self.param_status_var.set(f"{len(self.param_store)} parameter(s)")
+
+    def _refresh_param_tree_if_dirty(self):
+        if self._params_dirty:
+            self._params_dirty = False
+            self._refresh_param_tree()
+        self.root.after(PARAM_TREE_REFRESH_MS, self._refresh_param_tree_if_dirty)
 
     # ---- logging ---------------------------------------------------
     def log(self, text, kind="info"):
