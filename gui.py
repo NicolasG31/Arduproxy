@@ -208,6 +208,7 @@ class App:
         self.conn_mgr.on_message = self._threadsafe_on_message
         self.repeat_mgr = RepeatManager(self.conn_mgr)
         self.repeat_status_vars = {}  # entry id -> StringVar, refreshed periodically
+        self.log_entries = []  # every (timestamp, kind, text) logged, independent of the filter
 
         self.field_getters = {}  # field name -> callable returning raw string
         self.current_msg_name = None
@@ -242,6 +243,10 @@ class App:
             command=self._on_heartbeat_enabled_toggled,
         ).pack(side="left", padx=(0, 12))
 
+        ttk.Label(top, text="GCS sysid:").pack(side="left")
+        self.gcs_sysid_var = tk.StringVar(value="255")
+        ttk.Entry(top, textvariable=self.gcs_sysid_var, width=5).pack(side="left", padx=(2, 0))
+
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=8, pady=(0, 4))
 
@@ -267,10 +272,18 @@ class App:
         log_frame.pack(fill="both", expand=False)
         log_header = ttk.Frame(log_frame)
         log_header.pack(fill="x")
-        ttk.Label(log_header, text="Log (SENT / RECV):").pack(side="left", anchor="w")
+        ttk.Label(log_header, text="Log (SENT=blue / SITL=green / GCS=orange):").pack(side="left", anchor="w")
+        ttk.Label(log_header, text="Filter:").pack(side="left", padx=(16, 4))
+        self.log_filter_var = tk.StringVar(value="")
+        ttk.Entry(log_header, textvariable=self.log_filter_var, width=24).pack(side="left")
+        self.log_filter_var.trace_add("write", lambda *args: self._on_log_filter_changed())
         ttk.Button(log_header, text="Clear Log", command=self._clear_log).pack(side="right")
         self.log_text = tk.Text(log_frame, height=8, state="disabled", wrap="word")
         self.log_text.pack(fill="both", expand=True)
+        self.log_text.tag_configure("sent", foreground="#1a5fb4")
+        self.log_text.tag_configure("recv_sitl", foreground="#2e7d32")
+        self.log_text.tag_configure("recv_gcs", foreground="#c2410c")
+        self.log_text.tag_configure("info", foreground="#555555")
 
     def _build_message_tab(self, parent):
         message_choices = [(mm.get_message_class(name).id, name) for name in mm.MESSAGE_NAMES]
@@ -572,7 +585,7 @@ class App:
             self.conn_mgr.heartbeat_custom_mode = msg.custom_mode
             self.conn_mgr.heartbeat_system_status = msg.system_status
 
-        self.log(f"Sent {msg_name}: {raw_values}")
+        self.log(f"Sent {msg_name}: {raw_values}", kind="sent")
 
     def _on_send_command_clicked(self):
         cmd_value = self.current_cmd_value
@@ -596,7 +609,8 @@ class App:
             return
 
         self.log(
-            f"Sent COMMAND_LONG {cmd_name} ({cmd_value}) to {target_system}.{target_component}: params={params}"
+            f"Sent COMMAND_LONG {cmd_name} ({cmd_value}) to {target_system}.{target_component}: params={params}",
+            kind="sent",
         )
 
     # ---- repeat: starting a new one ---------------------------------
@@ -754,10 +768,37 @@ class App:
     def _threadsafe_on_message(self, msg):
         self.root.after(0, lambda: self._handle_incoming_message(msg))
 
+    def _classify_incoming(self, msg):
+        """Guess whether an incoming message is from the GCS or the
+        SITL/vehicle, since MAVLink itself carries no such origin tag - only
+        source_system/source_component. Anything with the configured GCS
+        system ID (255 by default, the QGroundControl/Mission
+        Planner/MAVProxy convention) is the GCS; everything else, in a
+        MAVProxy+SITL+GCS setup, is the vehicle.
+
+        Messages this app itself sends are never classified here - they're
+        logged as SENT at the point they're sent, not received back. There's
+        no separate "from Arduproxy" RECV case: MAVProxy doesn't loop a
+        packet back down the link it arrived on, and even if it did, Arduproxy
+        is normally configured with the vehicle's own sysid/compid (to
+        impersonate it), so such a packet would be indistinguishable from a
+        genuine SITL one anyway.
+        """
+        src_system = msg.get_srcSystem()
+        try:
+            gcs_sysid = int(self.gcs_sysid_var.get())
+        except ValueError:
+            gcs_sysid = 255
+        if src_system == gcs_sysid:
+            return "recv_gcs", "GCS"
+        return "recv_sitl", "SITL"
+
     def _handle_incoming_message(self, msg):
+        kind, origin = self._classify_incoming(msg)
         self.log(
-            f"RECV {msg.get_type()} from sys{msg.get_srcSystem()}.comp{msg.get_srcComponent()}: "
-            f"{mm.format_incoming_message(msg)}"
+            f"RECV[{origin}] {msg.get_type()} from sys{msg.get_srcSystem()}.comp{msg.get_srcComponent()}: "
+            f"{mm.format_incoming_message(msg)}",
+            kind=kind,
         )
         if msg.get_type() == "COMMAND_LONG" and self.auto_ack_var.get():
             self._send_auto_ack(msg)
@@ -774,17 +815,42 @@ class App:
             return
         cmd_name = mm.get_command_name(command_long_msg.command)
         result_name = self.ack_result_var.get().split(" - ", 1)[1]
-        self.log(f"Auto-ACK sent for {cmd_name} ({command_long_msg.command}): {result_name}")
+        self.log(f"Auto-ACK sent for {cmd_name} ({command_long_msg.command}): {result_name}", kind="sent")
 
     # ---- logging ---------------------------------------------------
-    def log(self, text):
-        timestamp = datetime.now().strftime("%H:%M:%S")
+    def log(self, text, kind="info"):
+        """kind is "sent", "recv", or "info" (default) - controls the log
+        line's color and whether typing that word into the Filter box
+        matches it, in addition to matching the line's own text."""
+        entry = (datetime.now().strftime("%H:%M:%S"), kind, text)
+        self.log_entries.append(entry)
+        if self._log_entry_matches_filter(entry):
+            self._append_log_line(entry)
+
+    def _append_log_line(self, entry):
+        timestamp, kind, text = entry
         self.log_text.configure(state="normal")
-        self.log_text.insert("end", f"[{timestamp}] {text}\n")
+        self.log_text.insert("end", f"[{timestamp}] {text}\n", (kind,))
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
+    def _log_entry_matches_filter(self, entry):
+        query = self.log_filter_var.get().strip().lower()
+        if not query:
+            return True
+        timestamp, kind, text = entry
+        return query in text.lower() or query in kind.lower()
+
+    def _on_log_filter_changed(self):
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+        for entry in self.log_entries:
+            if self._log_entry_matches_filter(entry):
+                self._append_log_line(entry)
+
     def _clear_log(self):
+        self.log_entries = []
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")

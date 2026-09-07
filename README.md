@@ -17,7 +17,7 @@ A small Tkinter + pymavlink GUI app for testing a Ground Control Station (GCS). 
   - Next to **Send** / **Send Command** is a **"Repeat every: [rate] [s/Hz] [Start Repeating]"** control — fill in a message/command's fields as usual, pick a rate (either an interval in seconds like `0.5`, or a frequency in Hz like `2`), and click it to have that exact message/command resent on a background timer instead of just once.
 - Every active repeat shows up in the **▶ Repeating** panel below the tabs (visible regardless of which tab is active) — collapsed by default, showing just a count (e.g. `▶ Repeating (2 active)`); click it to expand and see each entry, with its rate editable in place, a **Pause**/**Resume** toggle, a **Remove** button, and a live status line (send count and time since last send, or the last error if sends started failing).
 - MAVProxy receives these packets on its input link and forwards them to every output it's configured with — including your real GCS connection — exactly as if they'd come from the vehicle.
-- The app also **listens**: anything MAVProxy forwards back down that same link (e.g. a `COMMAND_LONG` your GCS issues — arm, mode change, takeoff, ...) is logged as a `RECV` line. By default it also **auto-replies with `COMMAND_ACK`** to any incoming `COMMAND_LONG`, via the **"Incoming commands"** controls at the bottom of the **Command (MAV_CMD)** tab (checkbox + result dropdown) — without this, GCS actions that wait for an acknowledgement would just hang against this app instead of showing you a reaction.
+- The app also **listens**: anything MAVProxy forwards back down that same link — e.g. a `COMMAND_LONG` your GCS issues (arm, mode change, takeoff, ...), or telemetry from a real SITL vehicle also wired into MAVProxy — is logged as a `RECV[GCS]` or `RECV[SITL]` line (see "Listening and auto-ACK" below for how that's decided). By default it also **auto-replies with `COMMAND_ACK`** to any incoming `COMMAND_LONG`, via the **"Incoming commands"** controls at the bottom of the **Command (MAV_CMD)** tab (checkbox + result dropdown) — without this, GCS actions that wait for an acknowledgement would just hang against this app instead of showing you a reaction.
 
 ### Connecting to MAVProxy
 
@@ -68,16 +68,17 @@ Other supported forms:
 
 7. **Repeat a message:** on the **Message** tab, pick e.g. `ATTITUDE`, set "Repeat every" to `10` with unit `Hz`, and click **Start Repeating**. The **▶ Repeating** bar below now reads `▶ Repeating (1 active)`; click it to expand and watch the send count tick up, then try **Pause**, **Resume**, changing the rate and clicking **Apply**, and finally **Remove**.
 
-8. **See it listen:** trigger anything in your real GCS that sends a command to the vehicle (e.g. its arm button). You should see a `RECV COMMAND_LONG ...` line in the log almost immediately followed by `Auto-ACK sent for ...`, and your GCS should show the command as accepted instead of timing out.
+8. **See it listen:** trigger anything in your real GCS that sends a command to the vehicle (e.g. its arm button). You should see a `RECV[GCS] COMMAND_LONG ...` line in the log almost immediately followed by `Auto-ACK sent for ...`, and your GCS should show the command as accepted instead of timing out.
 
 ## Listening and auto-ACK
 
 The app doesn't just send — the same link is read continuously in the background:
 
-- Every message received is logged as `RECV <TYPE> from sys<X>.comp<Y>: <fields>`.
+- Every message received is logged as `RECV[GCS|SITL] <TYPE> from sys<X>.comp<Y>: <fields>`. MAVLink carries no "who sent this" tag beyond `source_system`/`source_component`, so the app guesses by system ID: a message whose `source_system` matches the **"GCS sysid:"** field in the top bar (default `255`, the QGroundControl/Mission Planner/MAVProxy convention) is labeled `GCS`; anything else is labeled `SITL` (the vehicle) — the field is editable live if your GCS uses a non-default system ID. There's no separate "from Arduproxy" case in `RECV`: this app's own traffic is what's logged as `SENT` at send time, and MAVProxy doesn't loop a packet back down the link it arrived on, so a genuine self-echo essentially can't reach here — even if one did, since Arduproxy is normally configured with the vehicle's own sysid/compid to impersonate it (the connect dialog's "Source system ID"/"Source component ID" fields), it would be indistinguishable from a real SITL message anyway.
 - Any incoming `COMMAND_LONG` gets an automatic `COMMAND_ACK` reply when the **"Auto-ACK incoming COMMAND_LONG with result:"** checkbox, in the **Incoming commands** box at the bottom of the **Command (MAV_CMD)** tab, is ticked — **on by default**. The ack is addressed back to whoever sent the command (its `target_system`/`target_component` are set from the incoming message's source, not the app's own identity), with `command` matching what was requested and `result` taken from the dropdown next to the checkbox (any `MAV_RESULT` value — `ACCEPTED`, `DENIED`, `TEMPORARILY_REJECTED`, etc. — so you can test how your GCS handles a rejected command, not just the happy path).
 - Turn the checkbox off to test what your GCS does when a command is never acknowledged (e.g. a timeout/retry path), since that's now a deliberate choice rather than this app's only mode.
 - A **Clear Log** button (top-right of the log panel) is provided since RECV lines can add up quickly if your GCS polls frequently.
+- Log lines are colored by origin — **SENT (this app) in blue**, **RECV from SITL in green**, **RECV from GCS in orange**, everything else (connect/disconnect, repeat status, errors) in gray — and a **Filter** box above the log narrows it live to lines whose text or category (typing `sent`, `sitl`, `gcs`, `recv`, or `info` all work, since `recv` matches both RECV categories) contains what you type; clearing the box shows everything again. The filter only changes what's displayed — cleared/older lines are kept in memory and re-matched instantly if you change the filter, and **Clear Log** discards that backing history too.
 
 ### A Windows-specific gotcha we hit building this
 
@@ -124,7 +125,7 @@ Any message or command can be sent on a repeating timer instead of once:
 - Commands only support `COMMAND_LONG`, not `COMMAND_INT` (which uses `x`/`y`/`z` + a coordinate frame instead of `param5`-`param7`, and is mainly used for guided-mode position commands). Repeating inherits this limitation too.
 - Auto-ACK only handles `COMMAND_LONG`; other request/response protocols a real GCS might expect (`PARAM_REQUEST_LIST`→`PARAM_VALUE` streaming, mission upload/download) aren't emulated, so GCS screens relying on those will still hang against this app.
 - Repeats don't survive a disconnect/reconnect (see "Repeating sends" above) — this was a deliberate v1 choice, not an oversight.
-- Incoming messages are only logged as text, not shown in a structured/filterable view — with a chatty GCS this can scroll fast (use **Clear Log**).
+- Incoming messages are only logged as colored, filterable text (see "Listening and auto-ACK" above) — not a structured/sortable table, and there's no graphing of a field's value over time yet.
 
 ## A note on `pymavlink` field metadata
 

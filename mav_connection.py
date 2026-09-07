@@ -40,6 +40,8 @@ class ConnectionManager:
         self._recv_thread = None
         self._stop_recv = threading.Event()
         self.conn_string = ""
+        self.source_system = None
+        self.source_component = None
 
         self.on_status = None  # callback(str) for log/status lines
         self.on_disconnect = None  # callback() invoked if the link drops
@@ -71,6 +73,8 @@ class ConnectionManager:
         )
         self._conn = conn
         self.conn_string = conn_string
+        self.source_system = source_system
+        self.source_component = source_component
         _bind_udp_client_socket(conn)
         self._stop_heartbeat.clear()
         self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
