@@ -234,6 +234,14 @@ class App:
         self.status_var = tk.StringVar(value="Disconnected")
         ttk.Label(top, textvariable=self.status_var).pack(side="left", padx=12)
 
+        self.heartbeat_enabled_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            top,
+            text="Send background heartbeat",
+            variable=self.heartbeat_enabled_var,
+            command=self._on_heartbeat_enabled_toggled,
+        ).pack(side="left", padx=(0, 12))
+
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=8, pady=(0, 4))
 
@@ -356,8 +364,15 @@ class App:
     # ---- connection ---------------------------------------------------
     def _on_connect_clicked(self):
         if show_connect_dialog(self.root, self.conn_mgr):
-            self.log(f"Connected ({self.conn_mgr.conn_string}); sending HEARTBEAT every 1s.")
+            self.conn_mgr.heartbeat_enabled = self.heartbeat_enabled_var.get()
+            hb_note = "sending HEARTBEAT every 1s" if self.conn_mgr.heartbeat_enabled else "background HEARTBEAT disabled"
+            self.log(f"Connected ({self.conn_mgr.conn_string}); {hb_note}.")
         self._update_connection_ui()
+
+    def _on_heartbeat_enabled_toggled(self):
+        enabled = self.heartbeat_enabled_var.get()
+        self.conn_mgr.heartbeat_enabled = enabled
+        self.log("Background heartbeat enabled." if enabled else "Background heartbeat disabled.")
 
     def _on_disconnect_clicked(self):
         self.conn_mgr.disconnect()
@@ -403,11 +418,17 @@ class App:
                 label_text += f" ({spec.ctype}[{spec.array_len}], comma-separated)"
             elif spec.ctype == "char":
                 label_text += f" (text, max {spec.array_len} chars)"
+            elif spec.enum_name and mm.is_bitmask_enum(spec.enum_name):
+                label_text += " (bitmask - check flags to OR together)"
             ttk.Label(self.form_container.inner, text=label_text).grid(
                 row=row, column=0, sticky="w", pady=2, padx=(0, 8)
             )
 
-            if spec.enum_name and not mm.is_bitmask_enum(spec.enum_name):
+            if spec.enum_name and mm.is_bitmask_enum(spec.enum_name):
+                self.field_getters[spec.name] = self._build_bitmask_checkboxes(
+                    self.form_container.inner, row, spec.enum_name
+                )
+            elif spec.enum_name:
                 options = mm.get_enum_options(spec.enum_name)
                 values = [f"{val} - {name}" for val, name in options]
                 var = tk.StringVar(value=values[0] if values else "0")
@@ -419,6 +440,25 @@ class App:
                 entry = ttk.Entry(self.form_container.inner, textvariable=var, width=42)
                 entry.grid(row=row, column=1, sticky="w", pady=2)
                 self.field_getters[spec.name] = var.get
+
+    @staticmethod
+    def _build_bitmask_checkboxes(parent, row, enum_name, cols=3):
+        """A grid of one checkbox per bitmask flag; returns a getter for the
+        combined integer value (sum of the checked flags' bit values)."""
+        container = ttk.Frame(parent)
+        container.grid(row=row, column=1, sticky="w", pady=2)
+        vars_by_value = {}
+        for i, (bit_value, name) in enumerate(mm.get_bitmask_flag_options(enum_name)):
+            var = tk.BooleanVar(value=False)
+            vars_by_value[bit_value] = var
+            ttk.Checkbutton(container, text=f"{name} (0x{bit_value:x})", variable=var).grid(
+                row=i // cols, column=i % cols, sticky="w", padx=(0, 10)
+            )
+
+        def getter():
+            return str(sum(value for value, var in vars_by_value.items() if var.get()))
+
+        return getter
 
     @staticmethod
     def _make_enum_getter(var):

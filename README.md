@@ -9,7 +9,7 @@ A small Tkinter + pymavlink GUI app for testing a Ground Control Station (GCS). 
 ```
 
 - The app opens a MAVLink connection (UDP/TCP/serial) using `pymavlink`, in the role of the vehicle — it sets its own `source_system` / `source_component` on outgoing packets.
-- Once connected, it sends a `HEARTBEAT` message once per second on a background thread. Most GCS software (Mission Planner, QGroundControl, etc.) only considers a link "connected" once heartbeats start arriving, so this happens automatically and independently of anything else you send.
+- Once connected, it sends a `HEARTBEAT` message once per second on a background thread. Most GCS software (Mission Planner, QGroundControl, etc.) only considers a link "connected" once heartbeats start arriving, so this happens automatically and independently of anything else you send. The **"Send background heartbeat"** checkbox in the top bar (checked by default, toggleable whether connected or not) turns this off — useful if MAVProxy also has a real vehicle/SITL wired in as another master, since its HEARTBEAT already reaches the GCS and a second, differently-stated ~1Hz HEARTBEAT stream from this app will make the GCS flap between the two (e.g. mode/armed state changing every ~0.5s). Turn it off in that setup and rely on the real vehicle's heartbeat; turn it on when this app is standing in for the vehicle by itself.
 - The window has two tabs:
   - **Message** — pick any regular MAVLink message from a dropdown, shown as `ID - NAME` (e.g. `0 - HEARTBEAT`), fill in its fields in a form generated on the fly from `pymavlink`'s message definitions (so field names, types, and valid enum values always match what `pymavlink` actually supports), and click **Send** to fire it once.
   - **Command (MAV_CMD)** — pick any MAV_CMD command (e.g. `400 - MAV_CMD_COMPONENT_ARM_DISARM`), shown with its real description and per-parameter help text pulled straight from the MAVLink XML (so you know what `param1`..`param7` actually mean for that specific command), set the target system/component and confirmation, and click **Send Command** to fire it as a `COMMAND_LONG`.
@@ -60,7 +60,7 @@ Other supported forms:
    venv\Scripts\python.exe main.py
    ```
 
-4. **Connect:** click **Connect...**, leave the default `udpout:127.0.0.1:14550` (or edit to match your setup), and click **Connect**. The status bar should switch to "Connected" and HEARTBEATs start flowing.
+4. **Connect:** click **Connect...**, leave the default `udpout:127.0.0.1:14550` (or edit to match your setup), and click **Connect**. The status bar should switch to "Connected" and HEARTBEATs start flowing. If MAVProxy also has a real vehicle/SITL wired in, uncheck **"Send background heartbeat"** in the top bar first (see "How it works" above) so your GCS doesn't see two competing HEARTBEAT streams.
 
 5. **Send a message:** on the **Message** tab, type in the search box (by name, e.g. `status`, or by numeric ID, e.g. `253`) to find `253 - STATUSTEXT`, fill in the fields (e.g. `severity` = `2 - MAV_SEVERITY_CRITICAL`, `text` = `Battery critical`), click **Send**. It should appear in your GCS as coming from the vehicle. Sent messages are logged at the bottom of the window.
 
@@ -100,7 +100,7 @@ Any message or command can be sent on a repeating timer instead of once:
 
 - **Messages:** every message in `pymavlink`'s ArduPilot (v2.0) dialect (~295 messages) is available on the **Message** tab — search by name or numeric ID to find the one you need. Form fields are generated automatically per message:
   - **Enum fields** (e.g. `fix_type`, `severity`) show as a dropdown of `value - NAME`.
-  - **Bitmask-style fields** (e.g. `base_mode`, sensor health masks) are plain integer entries — enter the combined value directly (hex like `0x05` is accepted).
+  - **Bitmask-style fields** (e.g. `base_mode`, sensor health masks) show one checkbox per flag (`FLAG_NAME (0xNN)`); the field's value sent is the OR of whichever flags are checked. Only single-bit (power-of-two) enum entries are offered as checkboxes — see `mav_messages.get_bitmask_flag_options()`.
   - **Array fields** (e.g. `HOME_POSITION.q`, `BATTERY_STATUS.voltages`) take a comma-separated list of values.
   - **Text fields** (e.g. `STATUSTEXT.text`) are plain text entries, truncated to the MAVLink field's max length.
 
@@ -121,7 +121,6 @@ Any message or command can be sent on a repeating timer instead of once:
 ## Known limitations / ideas for v2
 
 - Commands only support `COMMAND_LONG`, not `COMMAND_INT` (which uses `x`/`y`/`z` + a coordinate frame instead of `param5`-`param7`, and is mainly used for guided-mode position commands). Repeating inherits this limitation too.
-- Bitmask fields are raw integer entry rather than a checkbox-per-flag UI.
 - Auto-ACK only handles `COMMAND_LONG`; other request/response protocols a real GCS might expect (`PARAM_REQUEST_LIST`→`PARAM_VALUE` streaming, mission upload/download) aren't emulated, so GCS screens relying on those will still hang against this app.
 - Repeats don't survive a disconnect/reconnect (see "Repeating sends" above) — this was a deliberate v1 choice, not an oversight.
 - Incoming messages are only logged as text, not shown in a structured/filterable view — with a chatty GCS this can scroll fast (use **Clear Log**).

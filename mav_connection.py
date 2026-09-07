@@ -51,6 +51,12 @@ class ConnectionManager:
         self.heartbeat_base_mode = mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
         self.heartbeat_custom_mode = 0
         self.heartbeat_system_status = mavlink.MAV_STATE_STANDBY
+        # When a real vehicle (e.g. SITL) is also wired into the same MAVProxy
+        # instance, its own HEARTBEAT already reaches the GCS and keeps the
+        # link "connected"; sending ours too just gives the GCS two competing
+        # ~1Hz HEARTBEAT streams to flap between. Off = skip sending, but the
+        # thread keeps running so toggling back on takes effect within ~1s.
+        self.heartbeat_enabled = True
 
     @property
     def connected(self):
@@ -98,15 +104,16 @@ class ConnectionManager:
     def _heartbeat_loop(self):
         while not self._stop_heartbeat.is_set():
             try:
-                hb = mavlink.MAVLink_heartbeat_message(
-                    type=self.heartbeat_type,
-                    autopilot=self.heartbeat_autopilot,
-                    base_mode=self.heartbeat_base_mode,
-                    custom_mode=self.heartbeat_custom_mode,
-                    system_status=self.heartbeat_system_status,
-                    mavlink_version=3,
-                )
-                self.send(hb)
+                if self.heartbeat_enabled:
+                    hb = mavlink.MAVLink_heartbeat_message(
+                        type=self.heartbeat_type,
+                        autopilot=self.heartbeat_autopilot,
+                        base_mode=self.heartbeat_base_mode,
+                        custom_mode=self.heartbeat_custom_mode,
+                        system_status=self.heartbeat_system_status,
+                        mavlink_version=3,
+                    )
+                    self.send(hb)
             except Exception as exc:
                 if self.on_status:
                     self.on_status(f"Heartbeat send failed, disconnecting: {exc}")

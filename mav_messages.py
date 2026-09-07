@@ -63,6 +63,17 @@ def is_bitmask_enum(enum_name):
     return enum_name in BITMASK_ENUM_NAMES
 
 
+def get_bitmask_flag_options(enum_name):
+    """Sorted list of (bit_value, name) for a bitmask enum's individual flags.
+
+    Only single-bit (power-of-two) entries are included, since those are the
+    ones that make sense as independent checkboxes to OR together; a
+    zero-valued "NONE" entry or a composite/reserved value wouldn't.
+    """
+    options = get_enum_options(enum_name)
+    return [(value, name) for value, name in options if value and (value & (value - 1)) == 0]
+
+
 def get_enum_options(enum_name):
     """Sorted list of (value, display_label) for a MAVLink enum."""
     enum_dict = mavlink.enums.get(enum_name, {})
